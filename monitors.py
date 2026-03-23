@@ -1,0 +1,473 @@
+# monitors.py
+import asyncio
+import time
+from collections import deque
+
+from config import *
+from utils import notifier
+
+
+class Monitors:
+    # --- 核心修复：添加一个内存字典，记录上一次报警时间 ---
+    # 格式: { "BTCUSDT_WALL": 1700000000, "ETHUSDT_PUMP": 1700000000 }
+    alert_history = {}
+    # 1. 价格池 (由 WebSocket 毫秒级更新)
+    price_map = {}
+    # 2. 持仓池 (由 轮询 60秒级更新)
+    oi_cache = {}
+    kline_stats = {}
+    valid_symbols = set()
+    vip_symbols = set()
+    wall_hits = {}
+    depth_counter = {}
+    agg_trade_window = {}
+    # 滑动窗口缓存
+    # 格式: { "BTCUSDT": deque([p1, p2, ..., p15], maxlen=15) }
+    rolling_window = {}
+    oi_window = {}
+    # 设定窗口大小：15分钟 (看过去 15根 1m K线)
+    WINDOW_SIZE = 15
+    # 设定趋势阈值：15分钟累计涨跌超过 4%
+    TREND_THRESHOLD = 0.04
+    @classmethod
+    def update_valid_symbols(cls, all_symbols, vip_subset):
+        cls.valid_symbols = set(s.upper() for s in all_symbols)
+        cls.vip_symbols = set(s.upper() for s in vip_subset)
+        print(f"🛡️ 监控名单: {len(cls.valid_symbols)} 个 | 🧠 AI名单: {len(cls.vip_symbols)} 个")
+    @classmethod
+    def _check_cooldown(cls, key, cooldown_seconds=300):
+        """
+        检查是否在冷却时间内
+        :param key: 唯一键值，例如 'PEPEUSDT_WALL_BUY'
+        :param cooldown_seconds: 默认冷却 300秒 (5分钟)
+        :return: True=可以发送, False=在冷却中
+        """
+        current_time = time.time()
+        cls.alert_history = {
+            k: v for k, v in cls.alert_history.items()
+            if current_time - v < 3600
+        }
+        last_time = cls.alert_history.get(key, 0)
+
+        if current_time - last_time > cooldown_seconds:
+            cls.alert_history[key] = current_time  # 更新时间
+            return True
+        return False
+
+    @staticmethod
+    def _get_thresholds(symbol):
+        # 1. 如果是 BTC / ETH
+        if symbol in KINGS:
+            return WALL_SIZE_KING, WHALE_MIN_KING
+
+        # 2. 如果是 SOL / XRP / DOGE 等
+        elif symbol in MAJORS:
+            return WALL_SIZE_MAJOR, WHALE_MIN_MAJOR
+
+        # 3. 其他所有山寨币
+        else:
+            return WALL_SIZE_ALT, WHALE_MIN_ALT
+
+    @staticmethod
+    def get_impact_pct(symbol):
+        if symbol in KINGS:
+            return 0.01  # 1.0%
+        elif symbol in MAJORS:
+            return 0.012  # 1.2%
+        else:
+            return 0.015  # 1.5%
+
+    @staticmethod
+    def _get_oi_threshold(symbol):
+        if symbol in KINGS:
+            return OI_THRESHOLD_KING
+        elif symbol in MAJORS:
+            return OI_THRESHOLD_MAJOR
+        else:
+            return OI_THRESHOLD_ALT
+
+    @classmethod
+    def _get_current_price(cls, symbol):
+        return cls.price_map.get(symbol, 0)
+
+    @classmethod
+    def _get_last_oi(cls, symbol):
+        # 返回 (数量, 更新时间)
+        data = cls.oi_cache.get(symbol)
+        if data:
+            return data['amount'], data['time'], data['delta']
+        return 0, 0, 0
+    # ---------------------------------------------------------
+    # 1. 深度数据处理 (已修复刷屏)
+    # ---------------------------------------------------------
+    @classmethod
+    async def process_depth(cls, data):
+        symbol = data.get('s')
+        if symbol not in cls.vip_symbols:
+            return
+        count = cls.depth_counter.get(symbol, 0)
+        cls.depth_counter[symbol] = count + 1
+        if count % 2 != 0:
+            return
+        bids = data.get('bids') or data.get('b')
+        asks = data.get('asks') or data.get('a')
+
+        if not bids or not asks: return
+
+        try:
+            bid1 = float(bids[0][0])
+            ask1 = float(asks[0][0])
+            mid_price = (bid1 + ask1) / 2
+            impact = cls.get_impact_pct(symbol)
+            target_up = mid_price * (1 + impact)
+            target_down = mid_price * (1 - impact)
+
+            # 计算卖盘阻力 (Resistance): 把 asks 从卖一加到 target_up
+            cost_to_pump = 0.0
+            reached_target_up = False
+            for p, q in asks:
+                p = float(p)
+                if p > target_up:
+                    reached_target_up = True
+                    break
+                cost_to_pump += p * float(q)
+
+            if not reached_target_up:
+                return
+
+            # 计算买盘支撑 (Support): 把 bids 从买一加到 target_down
+            cost_to_dump = 0.0
+            reached_target_down = False
+            for p, q in bids:
+                p = float(p)
+                if p < target_down:
+                    reached_target_down = True
+                    break
+                cost_to_dump += p * float(q)
+
+            if not reached_target_down:
+                return
+
+            # 防止除零错误 (极少见)
+            if cost_to_pump == 0 or cost_to_dump == 0:
+                return
+
+            # 信号判定：寻找“薄弱环节”
+
+            # 场景 A: 上方极度空虚 (易拉升)
+            # 逻辑：只要很少的钱(比如支撑的 1/5)就能拉上去
+            # 比如：砸下去要 100万，拉上去只要 20万 -> 阻力最小方向向上
+            if cost_to_dump > cost_to_pump * 5.0:
+                # 增加一个金额门槛，防止盘口太浅的垃圾时间误报
+                # 比如山寨币至少要有 5万 U 的抛压，否则可能是随便挂的
+                threshold = cls._get_thresholds(symbol)[0] / 4  # 动态取阈值的 1/4
+
+                if cost_to_pump > threshold:
+                    if cls._check_cooldown(f"{symbol}_DEPTH_BULL", 600):
+                        ratio = cost_to_dump / cost_to_pump
+                        await notifier.send_buffered(
+                            f"🚀 <b>阻力薄弱 (易拉升): {symbol}</b>\n"
+                            f"⬆️ 拉升{impact * 100}%成本: ${cost_to_pump:,.0f} (薄)\n"
+                            f"⬇️ 砸盘{impact * 100}%成本: ${cost_to_dump:,.0f} (厚)\n"
+                            f"📈 潜在盈亏比: {ratio:.1f}x\n"
+                            f"信号: 上方卖压真空，主力控盘"
+                        )
+
+            # 场景 B: 下方极度空虚 (易砸盘)
+            # 逻辑：支撑很薄，抛压很重
+            elif cost_to_pump > cost_to_dump * 5.0:
+                threshold = cls._get_thresholds(symbol)[0] / 4
+
+                if cost_to_dump > threshold:
+                    if cls._check_cooldown(f"{symbol}_DEPTH_BEAR", 600):
+                        ratio = cost_to_pump / cost_to_dump
+                        await notifier.send_buffered(
+                            f"🩸 <b>支撑薄弱 (易暴跌): {symbol}</b>\n"
+                            f"⬇️ 砸盘{impact * 100}%成本: ${cost_to_dump:,.0f} (薄)\n"
+                            f"⬆️ 拉升{impact * 100}%成本: ${cost_to_pump:,.0f} (厚)\n"
+                            f"📉 下跌阻力比: {ratio:.1f}x\n"
+                            f"信号: 下方承接无力，小心画门"
+                        )
+
+        except Exception as e:
+            print(f"[DEPTH ERROR] {symbol}: {e}")
+
+    # ---------------------------------------------------------
+    # 2. K线数据处理
+    # ---------------------------------------------------------
+    @classmethod
+    async def process_kline(cls, data):
+        k = data.get('k')
+        if not k: return
+        kline_vol = float(k['q'])
+        if kline_vol < 5000:
+            return
+        symbol = data.get('s')
+        close_p = float(k['c'])
+        is_closed = k['x']
+        cls.price_map[symbol] = close_p
+        if symbol not in cls.rolling_window:
+            cls.rolling_window[symbol] = deque(maxlen=cls.WINDOW_SIZE)
+        if is_closed:
+            cls.rolling_window[symbol].append(close_p)
+        if len(cls.rolling_window[symbol]) >= 10:
+
+            start_p = cls.rolling_window[symbol][0]
+
+            trend_pct = (close_p - start_p) / start_p
+            if abs(trend_pct) > cls.TREND_THRESHOLD:
+                if cls._check_cooldown(f"{symbol}_TREND", 900):  # 15m冷却
+
+                    direction = "📈 稳步爬升" if trend_pct > 0 else "📉 持续阴跌"
+
+                    oi_data = cls.oi_cache.get(symbol)
+                    oi_str = ""
+                    if oi_data:
+                        oi_trend = oi_data.get('delta_15m', 0)
+                        oi_val = oi_data['amount'] * close_p
+
+                        if abs(oi_trend) > 0.01:
+                            oi_emoji = "🔥 吸筹" if oi_trend > 0 else "💨 撤退"
+                            oi_str = (f"\n资金配合: {oi_emoji} {oi_trend * 100:+.2f}% (近15m)\n"
+                                      f"总持仓: ${oi_val:,.0f}")
+                        else:
+                            oi_str = f"\n资金配合: 😐 无明显变化 ({oi_trend * 100:+.2f}%)"
+
+                    await notifier.send_urgent(
+                        f"{direction} <b>{symbol}</b> (15m趋势)\n"
+                        f"累计幅度: {trend_pct * 100:+.2f}% (近{len(cls.rolling_window[symbol])}分钟)\n"
+                        f"现价: {close_p}"
+                        f"{oi_str}\n"
+                        f"信号: 价格与持仓趋势共振"
+                    )
+                    asyncio.create_task(
+                        notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
+                    )
+        open_p = float(k['o'])
+        change_pct = (close_p - open_p) / open_p
+        cls.kline_stats[symbol] = change_pct
+
+        if abs(change_pct) > PUMP_THRESHOLD:
+            direction = "PUMP" if change_pct > 0 else "DUMP"
+
+            if cls._check_cooldown(f"{symbol}_{direction}", 60):
+                emoji = "🚀 暴涨" if change_pct > 0 else "🩸 暴跌"
+
+                oi_qty, oi_time, delta = cls._get_last_oi(symbol)
+                oi_str = ""
+                if oi_qty > 0:
+                    oi_val = oi_qty * close_p
+                    # 计算数据延迟了多久
+                    lag = int(time.time() - oi_time)
+                    oi_str = f"\n持仓总量: ${oi_val:,.0f} ({lag}s前)"
+                    if delta is not None:
+                        oi_emoji = "🔥 激增" if delta > 0.02 else ("📉 骤减" if delta < -0.02 else "➡️")
+                        oi_str += f"\n持仓变化: {oi_emoji} {delta * 100:+.2f}%"
+                msg = (f"{emoji} <b>{symbol}</b> (1m)\n"
+                       f"幅度: {change_pct * 100:.2f}%\n"
+                       f"现价: {close_p}"
+                       f"{oi_str}")
+
+                # 【双发模式】
+                # 1. 立即发给 TG (快)
+                await notifier.send_urgent(msg)
+                asyncio.create_task(
+                    notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
+                )
+                # 2. 同时也发给 Buffer (给 AI 做上下文)
+                if symbol in cls.vip_symbols:
+                    await notifier.send_buffered(msg)
+
+    # 6. 持仓量处理 (OI 触发 -> 带上实时价格算金额)
+    @classmethod
+    async def process_oi_change_wrapper(cls, data):
+        symbol = data['symbol']
+        current_oi = float(data['openInterest'])
+        current_time = time.time()
+        if symbol not in cls.oi_window:
+            cls.oi_window[symbol] = deque(maxlen=15)
+        cls.oi_window[symbol].append(current_oi)
+        oi_trend_15m = 0.0
+        if len(cls.oi_window[symbol]) >= 10:  # 数据积累够了才算
+            start_oi = cls.oi_window[symbol][0]  # 15分钟前的 OI
+            if start_oi > 0:
+                oi_trend_15m = (current_oi - start_oi) / start_oi
+
+        # 1. 获取实时价格 (从 WebSocket 缓存拿)
+        price = cls._get_current_price(symbol)
+        if price == 0: return  # 没价格没法算 U，跳过
+
+        # 2. 读取上一次 OI
+        last_record = cls.oi_cache.get(symbol)
+        delta_pct = 0.0
+        if last_record and last_record['amount'] > 0:
+            delta_pct = (current_oi - last_record['amount']) / last_record['amount']
+
+        # 3. 无论是否报警，都要更新缓存 (供 K线监控 读取!)
+        cls.oi_cache[symbol] = {
+            'amount': current_oi,
+            'time': current_time,
+            'delta': delta_pct,
+            'delta_15m': oi_trend_15m
+        }
+        if (current_oi * price) < MIN_OI_VALUE:
+            return
+        if not last_record: return
+
+        # 4. 计算变化
+        if current_time - last_record['time'] > 120: return  # 数据太旧不对比
+
+        dynamic_threshold = cls._get_oi_threshold(symbol)
+        # 阈值过滤 (比如 5%)
+        if abs(delta_pct) > dynamic_threshold:
+            if cls._check_cooldown(f"{symbol}_OI", 60):
+                # 就算 OI 是 1分钟前的，价格我们用的是最新的，所以价值是准的
+                oi_val = current_oi * price
+                delta_val = (current_oi - last_record['amount']) * price
+
+                direction = "📈 增仓" if delta_pct > 0 else "📉 减仓"
+                kline_str = ""
+                last_kline_pct = cls.kline_stats.get(symbol)
+                if last_kline_pct is not None:
+                    k_emoji = "🔴" if last_kline_pct < 0 else "🟢"
+                    kline_str = f"\n对应币价: {k_emoji} {last_kline_pct * 100:+.2f}% (1m)"
+
+                msg = (f"📊 <b>持仓异动 (1m): {symbol}</b>\n"
+                    f"方向: {direction} {delta_pct * 100:.2f}%\n"
+                    f"变动: ${delta_val:,.0f}\n"
+                    f"总量: ${oi_val:,.0f}\n"
+                    f"现价: {price}"
+                    f"{kline_str}"
+                )
+                await notifier.send_urgent(msg)
+                asyncio.create_task(
+                    notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
+                )
+                if symbol in cls.vip_symbols:
+                    await notifier.send_buffered(msg)
+
+    # ---------------------------------------------------------
+    # 3. 逐笔成交处理
+    # ---------------------------------------------------------
+    @classmethod
+    async def process_agg_trade(cls, data):
+        symbol = data['s']
+        if symbol not in cls.vip_symbols:
+            return
+        price = float(data['p'])
+        qty = float(data['q'])
+        value = price * qty
+        ts = time.time()
+        # 动态获取阈值
+        _, whale_threshold = cls._get_thresholds(symbol)
+        if symbol not in KINGS and value < whale_threshold:
+            return
+        is_sell = data['m']
+        side = "SELL" if is_sell else "BUY"
+        if symbol in KINGS:
+            buf = cls.agg_trade_window.setdefault(symbol, [])
+
+            # 只保留最近 5 秒
+            buf.append((ts, value, side))
+            cls.agg_trade_window[symbol] = [
+                x for x in buf if ts - x[0] <= 5
+            ]
+
+            side_sum = sum(v for _, v, s in cls.agg_trade_window[symbol] if s == side)
+
+            if side_sum < whale_threshold:
+                return
+
+            if cls._check_cooldown(f"{symbol}_WHALE_{side}", 30):
+                emoji = "🔴 巨鲸出货" if is_sell else "🟢 巨鲸进场"
+                msg = (f"🐋 <b>{emoji} {symbol}</b>\n"
+                       f"5秒累计成交: ${side_sum:,.0f}\n"
+                       f"方向: {side}\n"
+                       f"现价: {price}")
+                if side_sum > 30000000:
+                    await notifier.send_buffered(msg)
+            return
+        if value < whale_threshold:
+            return
+        if cls._check_cooldown(f"{symbol}_WHALE_{side}", 5):
+            emoji = "🔴 巨鲸出货" if data['m'] else "🟢 巨鲸进场"
+            prefix = "🐋" if symbol in MAJORS else ""
+
+            await notifier.send_buffered(
+                f"{prefix} {emoji} <b>{symbol}</b>\n"
+                f"成交额: ${value:,.0f}\n"
+                f"价格: {price}"
+            )
+
+    # ---------------------------------------------------------
+    # 4. 合约爆仓处理
+    # ---------------------------------------------------------
+    @classmethod
+    async def process_force_order(cls, data):
+        order = data.get('o')
+        if not order:
+            return
+
+        symbol = order['s']
+        if symbol not in cls.vip_symbols:
+            return
+        amount = float(order['q']) * float(order['p'])
+
+        if "USDT" not in symbol: return
+        if amount < LIQUIDATION_MIN_VAL: return
+
+        # 爆仓也不需要长冷却，每一笔都重要
+        # 设个 1秒 防止重复推送
+        if cls._check_cooldown(f"{symbol}_LIQ", 1):
+            liq_side = "💀 多军爆仓" if order['S'] == "SELL" else "💀 空军爆仓"
+            await notifier.send_buffered(
+                f"{liq_side} <b>{symbol}</b>\n"
+                f"爆仓金额: ${amount:,.0f}"
+            )
+
+    # 5. 期现价差与费率监控 (!markPrice@arr)
+    @classmethod
+    async def process_mark_price(cls, data_list):
+        for item in data_list:
+            symbol = item['s']
+            if symbol not in cls.vip_symbols:
+                continue
+            if not symbol.endswith(QUOTE_ASSET):
+                continue
+            try:
+                funding_rate = float(item['r'])
+                mark_price = float(item['p'])  # 合约价格
+                cls.price_map[symbol] = mark_price
+                index_price = float(item['i'])  # 现货价格
+
+                if index_price == 0:
+                    continue
+
+                # 计算溢价率
+                premium_pct = (mark_price - index_price) / index_price
+                # --- 场景 A: 现货强拉 (负溢价) ---
+                if premium_pct < PREMIUM_NEGATIVE_THRESHOLD:
+                    if cls._check_cooldown(f"{symbol}_PREMIUM_NEG", 600):
+                        await notifier.send_buffered(
+                            f"💎 <b>现货强拉 (金铲子): {symbol}</b>\n"
+                            f"负溢价: {premium_pct * 100:.2f}%\n"
+                            # 【修复】这里把 > 改成了 &gt;
+                            f"现货: {index_price} &gt; 合约: {mark_price}\n"
+                            f"信号: 主力买现货，轧空前兆"
+                        )
+
+                # --- 场景 B: 现货出货 (正溢价) ---
+                elif premium_pct > PREMIUM_POSITIVE_THRESHOLD:
+                    if funding_rate > 0:
+                        if cls._check_cooldown(f"{symbol}_PREMIUM_POS", 600):
+                            await notifier.send_buffered(
+                                f"⚠️ <b>现货出货 (多头陷阱): {symbol}</b>\n"
+                                f"正溢价: +{premium_pct * 100:.2f}%\n"
+                                # 【修复】这里把 < 改成了 &lt;
+                                f"现货: {index_price} &lt; 合约: {mark_price}\n"
+                                f"费率: {funding_rate * 100:.4f}% (多头拥挤)\n"
+                                f"信号: 大户抛售现货，合约多头即将踩踏"
+                            )
+            except Exception as e:
+                print(f"Error processing {symbol}: {e}")
+                continue
