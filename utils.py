@@ -215,9 +215,25 @@ class TelegramNotifier:
             elif "巨鲸进场" in msg:
                 signal_type = "🐋巨鲸"
             
-            # 解析价格 (如果有)
-            price_match = re.search(r'\$([0-9.]+)', msg)
-            price = float(price_match.group(1)) if price_match else None
+            # 解析价格 (如果有) - 支持多种格式
+            price = None
+            
+            # 格式 1: "现价：3.283" 或 "现价：0.0456"
+            price_match = re.search(r'现价 [：:]\s*([0-9.]+)', msg)
+            if price_match:
+                price = float(price_match.group(1))
+            
+            # 格式 2: "$3.283" 或 "$0.0456"
+            if not price:
+                price_match = re.search(r'\$([0-9.]+)', msg)
+                if price_match:
+                    price = float(price_match.group(1))
+            
+            # 格式 3: "幅度：-2.02%\n现价：0.008535"
+            if not price:
+                price_match = re.search(r'价格 [：:]\s*([0-9.]+)', msg)
+                if price_match:
+                    price = float(price_match.group(1))
             
             # 写入数据库 (使用北京时间)
             from datetime import datetime, timezone, timedelta
