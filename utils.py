@@ -219,13 +219,16 @@ class TelegramNotifier:
             price_match = re.search(r'\$([0-9.]+)', msg)
             price = float(price_match.group(1)) if price_match else None
             
-            # 写入数据库
+            # 写入数据库 (使用北京时间)
+            from datetime import datetime, timezone, timedelta
+            beijing_time = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+            
             conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority)
-                VALUES (?, ?, ?, ?, ?)
-            """, (symbol, signal_type, msg, price, priority))
+                INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (symbol, signal_type, msg, price, priority, beijing_time))
             conn.commit()
             conn.close()
             
