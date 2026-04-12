@@ -164,14 +164,70 @@ class TelegramNotifier:
 
     # --- 方法 A: 紧急发送 (直接进队列) ---
     async def send_urgent(self, msg):
+        logger.info(f"🔥 [send_urgent] 收到紧急消息：{msg[:50]}...")
         try:
             self.queue.put_nowait(msg)
+            logger.info(f"✅ [send_urgent] 消息已放入队列，当前队列大小：{self.queue.qsize()}")
             print(f"[🔥URGENT] {msg[:20]}...")
         except asyncio.QueueFull:
+            logger.error("❌ [send_urgent] 紧急队列已满，消息丢弃！")
             print("[DROP] 紧急队列满")
+        except Exception as e:
+            logger.error(f"❌ [send_urgent] 异常：{e}", exc_info=True)
 
     # --- 方法 B: 缓冲发送 (进篮子) ---
+
+    async def _save_alert_to_db(self, msg):
+        """✅ 保存警报到 SQLite 数据库"""
+        import sqlite3
+        
+        try:
+            # 解析币种 (例如：JCTUSDT, GWEIUSDT)
+            symbol_match = re.search(r'<b>([A-Z]+USDT)</b>', msg)
+            symbol = symbol_match.group(1) if symbol_match else None
+            
+            if not symbol:
+                return
+            
+            # 解析信号类型
+            signal_type = "未知"
+            if "🚀 暴涨" in msg:
+                signal_type = "🚀暴涨"
+            elif "📈 稳步爬升" in msg:
+                signal_type = "📈爬升"
+            elif "📉 持续阴跌" in msg:
+                signal_type = "📉阴跌"
+            elif "🩸 暴跌" in msg:
+                signal_type = "🩸暴跌"
+            elif "阻力薄弱" in msg:
+                signal_type = "🧱阻力薄弱"
+            elif "支撑薄弱" in msg:
+                signal_type = "🧱支撑薄弱"
+            
+            # 解析价格 (如果有)
+            price_match = re.search(r'\$([0-9.]+)', msg)
+            price = float(price_match.group(1)) if price_match else None
+            
+            # 写入数据库
+            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO alerts (symbol, signal_type, message, price_at_alert)
+                VALUES (?, ?, ?, ?)
+            """, (symbol, signal_type, msg, price))
+            conn.commit()
+            conn.close()
+            
+            print(f"[📝DB] 保存警报：{symbol} {signal_type}")
+        
+        except Exception as e:
+            print(f"[❌DB] 保存警报失败：{e}")
+
+
     async def send_buffered(self, msg):
+        # ✅ 保存警报到数据库
+        await self._save_alert_to_db(msg)
+
         async with self.buffer_lock:
             # 去掉 HTML 标签，方便 LLM 阅读 (简单处理)
             clean_msg = msg.replace("<b>", "").replace("</b>", "")
@@ -310,20 +366,31 @@ class TelegramNotifier:
 
     # --- 底层发送逻辑 ---
     async def _send_to_tg(self, text):
+        logger.info(f"📤 [_send_to_tg] 准备发送消息到 Telegram...")
+        logger.info(f"🔍 [_send_to_tg] session={self.session}, closed={self.session.closed if self.session else 'None'}")
+        
         if not text:
+            logger.warning("⚠️ [_send_to_tg] 消息为空，跳过")
             return
         if self.session is None or self.session.closed:
-            logger.warning("Session closed, skipping send.")
+            logger.error(f"❌ [_send_to_tg] Session 已关闭！无法发送。session={self.session}, closed={self.session.closed if self.session else 'None'}")
             return
+        
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        logger.info(f"🌐 [_send_to_tg] POST {url}")
+        logger.info(f"📦 [_send_to_tg] payload: chat_id={TG_CHAT_ID}, text_len={len(text)}")
+        
         try:
             async with self.session.post(url, json=payload) as resp:
                 response_text = await resp.read()
+                logger.info(f"✅ [_send_to_tg] Telegram 响应：status={resp.status}")
                 if resp.status != 200:
-                    logger.error(f"TG Send Fail: ({resp.status}): {response_text}")
+                    logger.error(f"❌ [_send_to_tg] 发送失败：({resp.status}): {response_text}")
+                else:
+                    logger.info(f"✅ [_send_to_tg] 发送成功！")
         except Exception as e:
-            logger.error(f"TG Net Err: {e}")
+            logger.error(f"❌ [_send_to_tg] 网络异常：{e}", exc_info=True)
 
 
 notifier = TelegramNotifier()
