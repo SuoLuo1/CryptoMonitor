@@ -236,8 +236,7 @@ class TelegramNotifier:
 
 
     async def send_buffered(self, msg):
-        # ✅ 保存警报到数据库
-        await self._save_alert_to_db(msg)
+        # ❌ 不保存缓冲消息 (只保存紧急警报)
 
         async with self.buffer_lock:
             # 去掉 HTML 标签，方便 LLM 阅读 (简单处理)
