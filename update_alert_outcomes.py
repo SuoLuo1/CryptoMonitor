@@ -52,11 +52,12 @@ def update_outcomes():
     conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
     cursor = conn.cursor()
     
+    # 使用北京时间比较 (数据库存储的是北京时间)
     cursor.execute('''
         SELECT id, symbol, timestamp, price_at_alert
         FROM alerts
         WHERE analyzed = 0
-        AND timestamp < datetime('now', '-1 hour')
+        AND timestamp < datetime('now', 'localtime', '-1 hour')
         ORDER BY timestamp
     ''')
     
