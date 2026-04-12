@@ -218,20 +218,20 @@ class TelegramNotifier:
             # 解析价格 (如果有) - 支持多种格式
             price = None
             
-            # 格式 1: "现价：3.283" 或 "现价：0.0456"
-            price_match = re.search(r'现价 [：:]\s*([0-9.]+)', msg)
+            # 格式 1: "现价：3.283" (中文冒号)
+            price_match = re.search(r'现价：\s*([0-9.]+)', msg)
             if price_match:
                 price = float(price_match.group(1))
             
-            # 格式 2: "$3.283" 或 "$0.0456"
+            # 格式 2: "现价：3.283" (英文冒号)
             if not price:
-                price_match = re.search(r'\$([0-9.]+)', msg)
+                price_match = re.search(r'现价:\s*([0-9.]+)', msg)
                 if price_match:
                     price = float(price_match.group(1))
             
-            # 格式 3: "幅度：-2.02%\n现价：0.008535"
+            # 格式 3: "$3.283"
             if not price:
-                price_match = re.search(r'价格 [：:]\s*([0-9.]+)', msg)
+                price_match = re.search(r'\$([0-9.]+)', msg)
                 if price_match:
                     price = float(price_match.group(1))
             
