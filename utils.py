@@ -165,6 +165,9 @@ class TelegramNotifier:
 
     # --- 方法 A: 紧急发送 (直接进队列) ---
     async def send_urgent(self, msg):
+        # ✅ 保存警报到数据库
+        await self._save_alert_to_db(msg, priority='urgent')
+        
         logger.info(f"🔥 [send_urgent] 收到紧急消息：{msg[:50]}...")
         try:
             self.queue.put_nowait(msg)
@@ -178,8 +181,13 @@ class TelegramNotifier:
 
     # --- 方法 B: 缓冲发送 (进篮子) ---
 
-    async def _save_alert_to_db(self, msg):
-        """✅ 保存警报到 SQLite 数据库"""
+    async def _save_alert_to_db(self, msg, priority='buffered'):
+        """✅ 保存警报到 SQLite 数据库
+        
+        Args:
+            msg: 警报消息
+            priority: 'urgent' (紧急) 或 'buffered' (缓冲)
+        """
         import sqlite3
         
         try:
@@ -204,6 +212,8 @@ class TelegramNotifier:
                 signal_type = "🧱阻力薄弱"
             elif "支撑薄弱" in msg:
                 signal_type = "🧱支撑薄弱"
+            elif "巨鲸进场" in msg:
+                signal_type = "🐋巨鲸"
             
             # 解析价格 (如果有)
             price_match = re.search(r'\$([0-9.]+)', msg)
@@ -213,13 +223,13 @@ class TelegramNotifier:
             conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO alerts (symbol, signal_type, message, price_at_alert)
-                VALUES (?, ?, ?, ?)
-            """, (symbol, signal_type, msg, price))
+                INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority)
+                VALUES (?, ?, ?, ?, ?)
+            """, (symbol, signal_type, msg, price, priority))
             conn.commit()
             conn.close()
             
-            print(f"[📝DB] 保存警报：{symbol} {signal_type}")
+            print(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
         
         except Exception as e:
             print(f"[❌DB] 保存警报失败：{e}")
