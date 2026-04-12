@@ -2,6 +2,7 @@
 import asyncio
 import gc
 import io
+import re
 from datetime import datetime
 
 import aiohttp
