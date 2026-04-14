@@ -123,7 +123,7 @@ def get_current_price(symbol):
         pass
     return None
 
-def update_outcomes():
+def update_outcomes(batch_size=100):
     conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
     cursor = conn.cursor()
     
@@ -134,7 +134,8 @@ def update_outcomes():
         WHERE analyzed = 0
         AND timestamp < datetime('now', 'localtime', '-1 hour')
         ORDER BY timestamp
-    ''')
+        LIMIT ?
+    ''', (batch_size,))
     
     alerts = cursor.fetchall()
     
@@ -227,4 +228,22 @@ def update_outcomes():
     print(f"   失败：{failed} 条")
 
 if __name__ == '__main__':
-    update_outcomes()
+    import sys
+    
+    # 支持 --reanalyze 参数重新分析所有历史数据
+    if len(sys.argv) > 1 and sys.argv[1] == '--reanalyze':
+        print("🔄 重新分析所有历史警报...\n")
+        conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+        cursor = conn.cursor()
+        cursor.execute("UPDATE alerts SET analyzed = 0")
+        conn.commit()
+        conn.close()
+        print("✅ 已重置所有警报状态\n")
+    
+    # 支持 --batch N 参数分批处理
+    batch_size = 100
+    if len(sys.argv) > 1 and sys.argv[1].isdigit():
+        batch_size = int(sys.argv[1])
+        print(f"📦 分批处理：每次 {batch_size} 条\n")
+    
+    update_outcomes(batch_size)
