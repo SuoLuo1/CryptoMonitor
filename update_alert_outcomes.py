@@ -17,6 +17,18 @@ from datetime import datetime, timedelta
 BULLISH_SIGNALS = ["🟢 做多", "🟢 巨鲸进场", "🟢 增仓", "🟢 暴涨", "支撑薄弱", "正溢价", "🟢 金叉", "🚀暴涨", "📈爬升"]
 BEARISH_SIGNALS = ["🔴 做空", "🔴 巨鲸出货", "🔴 减仓", "🔴 暴跌", "阻力薄弱", "负溢价", "🔴 死叉", "🩸暴跌", "📉阴跌"]
 
+# 聚合窗口：同一币种在窗口内的多个信号合并为 1 次 (分钟)
+AGGREGATION_WINDOW = {
+    "暴涨": 5,       # 5 分钟内的暴涨算 1 次
+    "暴跌": 5,       # 5 分钟内的暴跌算 1 次
+    "爬升": 10,      # 10 分钟内的爬升算 1 次
+    "阴跌": 10,      # 10 分钟内的阴跌算 1 次
+    "巨鲸": 3,       # 3 分钟内的巨鲸算 1 次
+    "增仓": 5,       # 5 分钟内的 OI 变化算 1 次
+    "减仓": 5,       # 5 分钟内的 OI 变化算 1 次
+    "default": 5,    # 默认 5 分钟
+}
+
 # 不同信号类型的验证窗口 (分钟)
 VERIFICATION_WINDOWS = {
     "暴涨": 15,      # 暴涨信号 15 分钟内验证
@@ -146,15 +158,60 @@ def update_outcomes(batch_size=100):
     
     print(f"📊 待分析警报：{len(alerts)} 条\n")
     
+    # ========== 新增：时间窗口聚合 ==========
+    # 将同一币种在窗口内的多个信号合并为 1 次
+    aggregated = []  # [(symbol, signal_type, alert_time, price, [ids])]
+    
+    for alert_id, symbol, signal_type, alert_time_str, price_at_alert in alerts:
+        alert_time = datetime.strptime(alert_time_str, '%Y-%m-%d %H:%M:%S')
+        
+        # 获取该信号类型的聚合窗口
+        window_minutes = AGGREGATION_WINDOW.get("default")
+        for key, val in AGGREGATION_WINDOW.items():
+            if key in signal_type:
+                window_minutes = val
+                break
+        
+        # 查找是否已有该币种的聚合组
+        found_group = None
+        for group in aggregated:
+            g_symbol, g_signal_type, g_time, g_price, g_ids = group
+            
+            # 必须是同一币种 + 同类信号
+            if g_symbol != symbol or g_signal_type != signal_type:
+                continue
+            
+            # 检查是否在时间窗口内
+            time_diff = abs((alert_time - g_time).total_seconds()) / 60
+            if time_diff <= window_minutes:
+                found_group = group
+                break
+        
+        if found_group:
+            # 合并到已有组：更新为最早的时间 (更准确)
+            g_symbol, g_signal_type, g_time, g_price, g_ids = found_group
+            if alert_time < g_time:
+                found_group[2] = alert_time
+                found_group[3] = price_at_alert
+            found_group[4].append(alert_id)
+        else:
+            # 创建新组
+            aggregated.append([symbol, signal_type, alert_time, price_at_alert, [alert_id]])
+    
+    print(f"🔀 聚合后：{len(aggregated)} 次独立行情 (原 {len(alerts)} 条警报)")
+    print(f"   合并了 {len(alerts) - len(aggregated)} 条重复信号\n")
+    # =========================================
+    
     updated = 0
     kline_success = 0
     fallback_success = 0
     failed = 0
     
-    for alert_id, symbol, signal_type, alert_time_str, price_at_alert in alerts:
+    # 遍历聚合后的组
+    for group in aggregated:
+        symbol, signal_type, alert_time, price_at_alert, alert_ids = group
+        
         try:
-            alert_time = datetime.strptime(alert_time_str, '%Y-%m-%d %H:%M:%S')
-            
             # 1. 根据信号类型确定验证窗口
             window_minutes = VERIFICATION_WINDOWS.get("default")
             for key, val in VERIFICATION_WINDOWS.items():
@@ -194,29 +251,32 @@ def update_outcomes(batch_size=100):
                     change_pct = (high_price - price_at_alert) / price_at_alert * 100
                     is_success = 1 if change_pct >= 10 else 0
                 
-                cursor.execute('''
-                    UPDATE alerts
-                    SET price_1h_after = ?, change_1h_pct = ?, is_success = ?, analyzed = 1
-                    WHERE id = ?
-                ''', (high_price, change_pct, is_success, alert_id))
+                # 6. 更新该组所有警报 ID
+                for alert_id in alert_ids:
+                    cursor.execute('''
+                        UPDATE alerts
+                        SET price_1h_after = ?, change_1h_pct = ?, is_success = ?, analyzed = 1
+                        WHERE id = ?
+                    ''', (high_price, change_pct, is_success, alert_id))
                 
-                updated += 1
+                updated += len(alert_ids)
                 if use_fallback:
-                    fallback_success += 1
+                    fallback_success += len(alert_ids)
                 else:
-                    kline_success += 1
+                    kline_success += len(alert_ids)
                 
                 # 显示结果
                 direction = "多" if is_bullish else "空" if is_bearish else "?"
                 status = "✅" if is_success else "❌"
                 fb = " (FB)" if use_fallback else ""
-                print(f"  {symbol} [{direction}]: {change_pct:+.1f}% {status}{fb} (窗口:{window_minutes}m)")
+                group_info = f"[{len(alert_ids)}条合并]" if len(alert_ids) > 1 else ""
+                print(f"  {symbol} [{direction}]: {change_pct:+.1f}% {status}{fb} {group_info} (窗口:{window_minutes}m)")
             else:
-                failed += 1
+                failed += len(alert_ids)
                 print(f"  ❌ {symbol}: 价格无效 (警报={price_at_alert})")
         
         except Exception as e:
-            failed += 1
+            failed += len(alert_ids)
             print(f"  ❌ {symbol}: {e}")
     
     conn.commit()
