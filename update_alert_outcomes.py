@@ -11,8 +11,8 @@
 
 import sqlite3
 import requests
+import time
 from datetime import datetime, timedelta
-
 # 信号类型分类 (根据实际数据库中的格式)
 BULLISH_SIGNALS = ["🟢 做多", "🟢 巨鲸进场", "🟢 增仓", "🟢 暴涨", "支撑薄弱", "正溢价", "🟢 金叉", "🚀暴涨", "📈爬升"]
 BEARISH_SIGNALS = ["🔴 做空", "🔴 巨鲸出货", "🔴 减仓", "🔴 暴跌", "阻力薄弱", "负溢价", "🔴 死叉", "🩸暴跌", "📉阴跌"]

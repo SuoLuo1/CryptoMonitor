@@ -2,6 +2,7 @@
 import aiohttp
 import logging
 from config import BINANCE_HTTP_FUTURES, QUOTE_ASSET, MIN_VOLUME_24H, BLACKLIST, MIN_VOLUME_TG, MIN_VOLUME_AI
+from shared.binance_limiter import fetch_with_limit
 
 logger = logging.getLogger("SymbolMgr")
 
@@ -19,30 +20,37 @@ async def get_active_symbols(session):
 
     try:
         # --- 第一步：查户口 (exchangeInfo) ---
-        async with session.get(info_url) as resp:
-            if resp.status != 200:
-                logger.error(f"ExchangeInfo 请求失败: {resp.status}")
-                return {"all": [], "vip": []}
-            info_data = await resp.json()
-            for s in info_data['symbols']:
-                # 【核心过滤参数】
-                # 1. 必须是交易中 (TRADING)
-                if s['status'] != 'TRADING': continue
-                # 2. 必须是永续合约 (PERPETUAL) -> 自动过滤掉交割单、BFUSD等奇怪东西
-                if s['contractType'] != 'PERPETUAL': continue
-                # 3. 必须是 USDT 结算
-                if s['quoteAsset'] != QUOTE_ASSET: continue
+        info_data = await fetch_with_limit(
+            info_url,
+            endpoint="exchangeInfo",
+            infinite_wait=True,
+        )
+        if not info_data:
+            logger.error("ExchangeInfo 请求失败")
+            return {"all": [], "vip": []}
+        
+        for s in info_data['symbols']:
+            # 【核心过滤参数】
+            # 1. 必须是交易中 (TRADING)
+            if s['status'] != 'TRADING': continue
+            # 2. 必须是永续合约 (PERPETUAL) -> 自动过滤掉交割单、BFUSD 等奇怪东西
+            if s['contractType'] != 'PERPETUAL': continue
+            # 3. 必须是 USDT 结算
+            if s['quoteAsset'] != QUOTE_ASSET: continue
 
-                active_perpetuals.add(s['symbol'])
+            active_perpetuals.add(s['symbol'])
 
-        logger.info(f"Binance 在架活跃永续合约共: {len(active_perpetuals)} 个")
+        logger.info(f"Binance 在架活跃永续合约共：{len(active_perpetuals)} 个")
 
         # --- 第二步：查流水 (ticker) ---
-        async with session.get(ticker_url) as resp:
-            if resp.status != 200:
-                logger.error(f"Ticker 请求失败: {resp.status}")
-                return {"all": [], "vip": []}
-            ticker_data = await resp.json()
+        ticker_data = await fetch_with_limit(
+            ticker_url,
+            endpoint="ticker/24hr",
+            infinite_wait=True,
+        )
+        if not ticker_data:
+            logger.error("Ticker 请求失败")
+            return {"all": [], "vip": []}
             tg_symbols = []  # 对应 500w+
             vip_symbols = []  # 对应 1000w+
 

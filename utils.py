@@ -271,17 +271,22 @@ class TelegramNotifier:
         if not self.session: return
 
         try:
-            # 1. 临时拉取 K 线 (为了均线准确，拉 200 根)
+            # 1. 临时拉取 K 线（为了均线准确，拉 200 根）
             url = f"{BINANCE_HTTP_FUTURES}/fapi/v1/klines"
             params = {'symbol': symbol, 'interval': timeframe, 'limit': 200}
-
-            async with self.session.get(url, params=params, timeout=5) as resp:
-                if resp.status != 200:
-                    logger.warning(f"❌ 拉K线失败: {symbol} {resp.status}")
-                    return
-                raw_data = await resp.json()
-
-            if not raw_data: return
+            
+            # 使用限流器
+            from shared.binance_limiter import fetch_with_limit
+            raw_data = await fetch_with_limit(
+                url,
+                params=params,
+                endpoint="klines",
+                infinite_wait=False,
+            )
+            
+            if not raw_data:
+                logger.warning(f"❌ 拉 K 线失败：{symbol}")
+                return
 
             # 2. 转换数据
             df = pd.DataFrame(raw_data, columns=[
