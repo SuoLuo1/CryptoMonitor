@@ -9,7 +9,7 @@ import logging
 
 import symbol_manager
 from config import BINANCE_WS_FUTURES_COMBINED, BINANCE_WS_FUTURES_RAW, BINANCE_HTTP_FUTURES
-from shared.binance_limiter import fetch_with_limit
+from shared.binance_limiter import limited_get
 from monitors import Monitors
 
 logger = logging.getLogger("ConnMgr")
@@ -304,13 +304,14 @@ class MultiConnectionManager:
         async with sem:
             try:
                 # 使用限流器（从响应头读取权重）
-                data = await fetch_with_limit(
+                resp = limited_get(
                     url,
                     params={"symbol": symbol},
                     endpoint="openInterest",
-                    infinite_wait=False,  # 定时轮询，限流时跳过
                 )
-                return data
+                if resp:
+                    return resp.json()
+                return None
             except Exception:
                 pass
             return None

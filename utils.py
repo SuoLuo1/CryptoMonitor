@@ -276,17 +276,17 @@ class TelegramNotifier:
             params = {'symbol': symbol, 'interval': timeframe, 'limit': 200}
             
             # 使用限流器
-            from shared.binance_limiter import fetch_with_limit
-            raw_data = await fetch_with_limit(
+            from shared.binance_limiter import limited_get
+            resp = limited_get(
                 url,
                 params=params,
                 endpoint="klines",
-                infinite_wait=False,
             )
             
-            if not raw_data:
+            if not resp:
                 logger.warning(f"❌ 拉 K 线失败：{symbol}")
                 return
+            raw_data = resp.json()
 
             # 2. 转换数据
             df = pd.DataFrame(raw_data, columns=[
@@ -315,10 +315,10 @@ class TelegramNotifier:
 
             async with self.session.post(url, data=data, timeout=30) as resp:
                 if resp.status != 200:
-                    logger.error(f"❌ 发图失败: {await resp.text()}")
+                    logger.error(f"❌ 发图失败：{await resp.text()}")
 
         except Exception as e:
-            logger.error(f"❌ 发送图表流程出错: {e}")
+            logger.error(f"❌ 发送图表流程出错：{e}", exc_info=True)
 
     # --- 任务 1: 紧急消息发送循环---
     async def _urgent_worker(self):

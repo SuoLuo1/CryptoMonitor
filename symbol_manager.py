@@ -2,7 +2,7 @@
 import aiohttp
 import logging
 from config import BINANCE_HTTP_FUTURES, QUOTE_ASSET, MIN_VOLUME_24H, BLACKLIST, MIN_VOLUME_TG, MIN_VOLUME_AI
-from shared.binance_limiter import fetch_with_limit
+from shared.binance_limiter import limited_get
 
 logger = logging.getLogger("SymbolMgr")
 
@@ -20,14 +20,11 @@ async def get_active_symbols(session):
 
     try:
         # --- 第一步：查户口 (exchangeInfo) ---
-        info_data = await fetch_with_limit(
-            info_url,
-            endpoint="exchangeInfo",
-            infinite_wait=True,
-        )
-        if not info_data:
+        info_resp = limited_get(info_url, endpoint="exchangeInfo")
+        if not info_resp:
             logger.error("ExchangeInfo 请求失败")
             return {"all": [], "vip": []}
+        info_data = info_resp.json()
         
         for s in info_data['symbols']:
             # 【核心过滤参数】
@@ -43,18 +40,16 @@ async def get_active_symbols(session):
         logger.info(f"Binance 在架活跃永续合约共：{len(active_perpetuals)} 个")
 
         # --- 第二步：查流水 (ticker) ---
-        ticker_data = await fetch_with_limit(
-            ticker_url,
-            endpoint="ticker/24hr",
-            infinite_wait=True,
-        )
-        if not ticker_data:
+        ticker_resp = limited_get(ticker_url, endpoint="ticker/24hr")
+        if not ticker_resp:
             logger.error("Ticker 请求失败")
             return {"all": [], "vip": []}
-            tg_symbols = []  # 对应 500w+
-            vip_symbols = []  # 对应 1000w+
-
-            for item in ticker_data:
+        ticker_data = ticker_resp.json()
+        
+        tg_symbols = []  # 对应 500w+
+        vip_symbols = []  # 对应 1000w+
+        
+        for item in ticker_data:
                 symbol = item['symbol']
 
                 # 1. 必须在"户口本"里 (排除掉已经下架但api还有残留的)

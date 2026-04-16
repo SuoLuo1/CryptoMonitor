@@ -25,7 +25,7 @@ class BinanceLimiter:
     
     # 配置
     MAX_WEIGHT = 2400
-    SAFE_THRESHOLD = 2000      # 83%
+    SAFE_THRESHOLD = 2200      # 92% - 提高阈值允许发图
     WARNING_THRESHOLD = 1680   # 70%
     
     # 内存存储
@@ -66,6 +66,12 @@ class BinanceLimiter:
         """检查是否可以请求"""
         if cls.is_blocked():
             return False
+        
+        # 🔄 币安权重每分钟重置，检查是否需要重置
+        if time.time() - cls._last_update > 60:
+            print(f"[{datetime.now()}] 🔄 权重重置：{cls._current_weight} -> 0 (已过 60 秒)")
+            cls._current_weight = 0
+            cls._last_update = time.time()
         
         if cls._current_weight + weight > cls.SAFE_THRESHOLD:
             print(f"[{datetime.now()}] ⚠️ 权重接近限制：{cls._current_weight}/{cls.SAFE_THRESHOLD}，跳过请求")
