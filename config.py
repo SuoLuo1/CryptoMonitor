@@ -57,5 +57,6 @@ OI_THRESHOLD_ALT = 0.03    # 3%
 # 最小持仓价值 (过滤垃圾币)
 MIN_OI_VALUE = 5000000
 BINANCE_HTTP_FUTURES = "https://fapi.binance.com"
-BINANCE_WS_FUTURES_COMBINED = "wss://fstream.binance.com/stream?streams="
-BINANCE_WS_FUTURES_RAW = "wss://fstream.binance.com/ws"
+# 币安 WebSocket URL（新架构：/market 用于常规市场数据 ticker/kline/markPrice/aggTrade）
+BINANCE_WS_FUTURES_COMBINED = "wss://fstream.binance.com/market/stream?streams="
+BINANCE_WS_FUTURES_RAW = "wss://fstream.binance.com/market/ws"
