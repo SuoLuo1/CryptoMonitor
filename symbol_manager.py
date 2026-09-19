@@ -59,14 +59,13 @@ async def get_active_symbols(session):
                 base_asset = symbol.replace(QUOTE_ASSET, "")
                 if base_asset in BLACKLIST:
                     continue
-                # 2. 流动性过滤
-                vol = float(item['quoteVolume'])
-                if vol >= MIN_VOLUME_TG:
-                    tg_symbols.append(symbol)
+                # 2. 监控名单: 不再限制成交额, 全市场活跃永续都监控
+                tg_symbols.append(symbol)
 
-                    # 2. 如果同时也大于 AI 门槛 (1000w)，加入 VIP 名单
-                    if vol >= MIN_VOLUME_AI:
-                        vip_symbols.append(symbol)
+                # 3. VIP(AI)名单仍保留 1000w 成交额门槛
+                vol = float(item['quoteVolume'])
+                if vol >= MIN_VOLUME_AI:
+                    vip_symbols.append(symbol)
 
 
         logger.info(f"双重过滤结果: 监控总数 {len(tg_symbols)} 个 | 其中 VIP(AI) {len(vip_symbols)} 个")

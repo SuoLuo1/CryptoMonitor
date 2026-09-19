@@ -200,14 +200,15 @@ class TelegramNotifier:
             
             # 解析信号类型
             signal_type = "未知"
+            is_3m = "(3m放量)" in msg
             if "🚀 暴涨" in msg:
-                signal_type = "🚀暴涨"
+                signal_type = "🚀暴涨3m" if is_3m else "🚀暴涨"
             elif "📈 稳步爬升" in msg:
                 signal_type = "📈爬升"
             elif "📉 持续阴跌" in msg:
                 signal_type = "📉阴跌"
             elif "🩸 暴跌" in msg:
-                signal_type = "🩸暴跌"
+                signal_type = "🩸暴跌3m" if is_3m else "🩸暴跌"
             elif "阻力薄弱" in msg:
                 signal_type = "🧱阻力薄弱"
             elif "支撑薄弱" in msg:

@@ -56,6 +56,7 @@ class MultiConnectionManager:
         for s in symbols_list:
             stream_list.append(f"{s.lower()}@aggTrade")
             stream_list.append(f"{s.lower()}@kline_1m")
+            stream_list.append(f"{s.lower()}@kline_3m")
             stream_list.append(f"{s.lower()}@depth50@500ms")
 
         full_url = BINANCE_WS_FUTURES_COMBINED + "/".join(stream_list)

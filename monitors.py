@@ -25,6 +25,8 @@ class Monitors:
     # 格式: { "BTCUSDT": deque([p1, p2, ..., p15], maxlen=15) }
     rolling_window = {}
     oi_window = {}
+    # 3m K线成交量窗口 (存前5根已收盘K线的成交额, 用于放量确认)
+    vol_window_3m = {}
     # 设定窗口大小：15分钟 (看过去 15根 1m K线)
     WINDOW_SIZE = 15
     # 设定趋势阈值：15分钟累计涨跌超过 4%
@@ -199,6 +201,10 @@ class Monitors:
     async def process_kline(cls, data):
         k = data.get('k')
         if not k: return
+        interval = k.get('i')
+        if interval == '3m':
+            await cls._process_kline_3m(k)
+            return
         kline_vol = float(k['q'])
         if kline_vol < 5000:
             return
@@ -277,6 +283,69 @@ class Monitors:
                 # 2. 同时也发给 Buffer (给 AI 做上下文)
                 if symbol in cls.vip_symbols:
                     await notifier.send_buffered(msg)
+
+    # ---------------------------------------------------------
+    # 2b. 3分钟K线放量异动 (与1m暴涨暴跌同通道)
+    #     条件: 3m涨跌 > 2% 且 本根成交额 > 前5根已收盘K线均量 * 3
+    # ---------------------------------------------------------
+    @classmethod
+    async def _process_kline_3m(cls, k):
+        symbol = k.get('s')
+        if not symbol: return
+        kline_vol = float(k['q'])  # 本根成交额 (USDT)
+        if kline_vol < 5000:
+            return
+
+        # 维护前5根已收盘K线的成交额窗口
+        if symbol not in cls.vol_window_3m:
+            cls.vol_window_3m[symbol] = deque(maxlen=5)
+        if k['x']:  # K线收盘 -> 存入窗口, 本根不做信号判断(收盘才判断会滞后3分钟)
+            cls.vol_window_3m[symbol].append(kline_vol)
+            return
+
+        vol_window = cls.vol_window_3m[symbol]
+        if len(vol_window) < 5:  # 历史量不足, 无法确认放量
+            return
+
+        open_p = float(k['o'])
+        close_p = float(k['c'])
+        if open_p <= 0: return
+        change_pct = (close_p - open_p) / open_p
+        if abs(change_pct) <= PUMP_3M_THRESHOLD:
+            return
+
+        # 放量确认: 本根成交额 > 前5根均量 * 3
+        vol_ma5 = sum(vol_window) / len(vol_window)
+        if vol_ma5 <= 0 or kline_vol < vol_ma5 * VOL_MA5_MULTIPLIER:
+            return
+
+        direction = "PUMP" if change_pct > 0 else "DUMP"
+        if cls._check_cooldown(f"{symbol}_3M_{direction}", 60):
+            emoji = "🚀 暴涨" if change_pct > 0 else "🩸 暴跌"
+            vol_ratio = kline_vol / vol_ma5
+            oi_qty, oi_time, delta = cls._get_last_oi(symbol)
+            oi_str = ""
+            if oi_qty > 0:
+                oi_val = oi_qty * close_p
+                lag = int(time.time() - oi_time)
+                oi_str = f"\n持仓总量: ${oi_val:,.0f} ({lag}s前)"
+                if delta is not None:
+                    oi_emoji = "🔥 激增" if delta > 0.02 else ("📉 骤减" if delta < -0.02 else "➡️")
+                    oi_str += f"\n持仓变化: {oi_emoji} {delta * 100:+.2f}%"
+            msg = (f"{emoji} <b>{symbol}</b> (3m放量)\n"
+                   f"幅度: {change_pct * 100:.2f}%\n"
+                   f"放量: {vol_ratio:.1f}x (vs 前5根均量)\n"
+                   f"成交额: ${kline_vol:,.0f}\n"
+                   f"现价: {close_p}"
+                   f"{oi_str}")
+
+            # 【双发模式】与1m信号一致
+            await notifier.send_urgent(msg)
+            asyncio.create_task(
+                notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
+            )
+            if symbol in cls.vip_symbols:
+                await notifier.send_buffered(msg)
 
     # 6. 持仓量处理 (OI 触发 -> 带上实时价格算金额)
     @classmethod
