@@ -7,6 +7,7 @@ from datetime import datetime
 
 import aiohttp
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import pandas as pd
 import os
 import matplotlib.font_manager as fm
@@ -17,8 +18,24 @@ import matplotlib
 from concurrent.futures import ThreadPoolExecutor
 from config import TG_BOT_TOKEN, TG_CHAT_ID, BINANCE_HTTP_FUTURES
 from llm_agent import DeepSeekAgent
+
 matplotlib.use('Agg')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+# 日志输出：stderr（journal）+ 文件按天轮转（兜底复盘）
+LOG_DIR = "/root/CryptoMonitor/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+_log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] [%(name)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s')
+_file_handler = TimedRotatingFileHandler(
+    filename=os.path.join(LOG_DIR, "cryptomonitor.log"),
+    when="midnight",
+    interval=1,
+    backupCount=7,
+    encoding="utf-8",
+    utc=False,
+)
+_file_handler.setFormatter(_log_formatter)
+logging.getLogger().addHandler(_file_handler)
 logger = logging.getLogger("Notifier")
 
 
@@ -401,31 +418,44 @@ class TelegramNotifier:
 
     # --- 底层发送逻辑 ---
     async def _send_to_tg(self, text):
-        logger.info(f"📤 [_send_to_tg] 准备发送消息到 Telegram...")
-        logger.info(f"🔍 [_send_to_tg] session={self.session}, closed={self.session.closed if self.session else 'None'}")
-        
+        """
+        【修复】加重试上限，避免 TG 不可达时死磕导致连接堆积
+        """
         if not text:
             logger.warning("⚠️ [_send_to_tg] 消息为空，跳过")
             return
         if self.session is None or self.session.closed:
             logger.error(f"❌ [_send_to_tg] Session 已关闭！无法发送。session={self.session}, closed={self.session.closed if self.session else 'None'}")
             return
-        
+
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        logger.info(f"🌐 [_send_to_tg] POST {url}")
-        logger.info(f"📦 [_send_to_tg] payload: chat_id={TG_CHAT_ID}, text_len={len(text)}")
-        
-        try:
-            async with self.session.post(url, json=payload) as resp:
-                response_text = await resp.read()
-                logger.info(f"✅ [_send_to_tg] Telegram 响应：status={resp.status}")
-                if resp.status != 200:
-                    logger.error(f"❌ [_send_to_tg] 发送失败：({resp.status}): {response_text}")
-                else:
-                    logger.info(f"✅ [_send_to_tg] 发送成功！")
-        except Exception as e:
-            logger.error(f"❌ [_send_to_tg] 网络异常：{e}", exc_info=True)
+        logger.info(f"📤 [_send_to_tg] 准备发送 (len={len(text)})")
+
+        MAX_RETRIES = 3
+        last_err = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with self.session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    response_text = await resp.read()
+                    if resp.status == 200:
+                        logger.info(f"✅ [_send_to_tg] 发送成功 (attempt {attempt})")
+                        return
+                    logger.error(f"❌ [_send_to_tg] 非 200 ({attempt}/{MAX_RETRIES}): {resp.status} body={response_text[:200]}")
+                    last_err = f"HTTP {resp.status}"
+                    # 4xx 是参数问题，不再重试
+                    if 400 <= resp.status < 500:
+                        break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"⚠️ [_send_to_tg] 网络异常 ({attempt}/{MAX_RETRIES}): {e}")
+                last_err = str(e)
+            # 指数退避后重试
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(2 ** attempt)
+
+        # 全部失败：进 dead-letter，不再阻塞
+        logger.error(f"❌ [_send_to_tg] 彻底失败 ({MAX_RETRIES}次)，丢弃消息进 dead-letter: last_err={last_err}, text={text[:80]}")
+        # TODO: 写入本地 dead-letter 文件供事后回溯
 
 
 notifier = TelegramNotifier()

@@ -27,10 +27,10 @@ class Monitors:
     oi_window = {}
     # 3m K线成交量窗口 (存前5根已收盘K线的成交额, 用于放量确认)
     vol_window_3m = {}
-    # 设定窗口大小：15分钟 (看过去 15根 1m K线)
-    WINDOW_SIZE = 15
-    # 设定趋势阈值：15分钟累计涨跌超过 4%
-    TREND_THRESHOLD = 0.04
+    # 设定窗口大小：60 分钟 (看过去 60根 1m K线 = 1小时趋势)
+    WINDOW_SIZE = 60
+    # 设定趋势阈值：1小时累计涨跌超过 5%
+    TREND_THRESHOLD = 0.05
     @classmethod
     def update_valid_symbols(cls, all_symbols, vip_subset):
         cls.valid_symbols = set(s.upper() for s in all_symbols)
@@ -222,25 +222,25 @@ class Monitors:
 
             trend_pct = (close_p - start_p) / start_p
             if abs(trend_pct) > cls.TREND_THRESHOLD:
-                if cls._check_cooldown(f"{symbol}_TREND", 900):  # 15m冷却
+                if cls._check_cooldown(f"{symbol}_TREND", 1800):  # 1H冷却
 
                     direction = "📈 稳步爬升" if trend_pct > 0 else "📉 持续阴跌"
 
                     oi_data = cls.oi_cache.get(symbol)
                     oi_str = ""
                     if oi_data:
-                        oi_trend = oi_data.get('delta_15m', 0)
+                        oi_trend = oi_data.get('delta_1h', 0)
                         oi_val = oi_data['amount'] * close_p
 
                         if abs(oi_trend) > 0.01:
                             oi_emoji = "🔥 吸筹" if oi_trend > 0 else "💨 撤退"
-                            oi_str = (f"\n资金配合: {oi_emoji} {oi_trend * 100:+.2f}% (近15m)\n"
+                            oi_str = (f"\n资金配合: {oi_emoji} {oi_trend * 100:+.2f}% (近1h)\n"
                                       f"总持仓: ${oi_val:,.0f}")
                         else:
                             oi_str = f"\n资金配合: 😐 无明显变化 ({oi_trend * 100:+.2f}%)"
 
                     await notifier.send_urgent(
-                        f"{direction} <b>{symbol}</b> (15m趋势)\n"
+                        f"{direction} <b>{symbol}</b> (1H趋势)\n"
                         f"累计幅度: {trend_pct * 100:+.2f}% (近{len(cls.rolling_window[symbol])}分钟)\n"
                         f"现价: {close_p}"
                         f"{oi_str}\n"
@@ -354,13 +354,13 @@ class Monitors:
         current_oi = float(data['openInterest'])
         current_time = time.time()
         if symbol not in cls.oi_window:
-            cls.oi_window[symbol] = deque(maxlen=15)
+            cls.oi_window[symbol] = deque(maxlen=60)
         cls.oi_window[symbol].append(current_oi)
-        oi_trend_15m = 0.0
-        if len(cls.oi_window[symbol]) >= 10:  # 数据积累够了才算
-            start_oi = cls.oi_window[symbol][0]  # 15分钟前的 OI
+        oi_trend_1h = 0.0
+        if len(cls.oi_window[symbol]) >= 30:  # 数据积累够了才算（至少半小时数据）
+            start_oi = cls.oi_window[symbol][0]  # 1小时前的 OI
             if start_oi > 0:
-                oi_trend_15m = (current_oi - start_oi) / start_oi
+                oi_trend_1h = (current_oi - start_oi) / start_oi
 
         # 1. 获取实时价格 (从 WebSocket 缓存拿)
         price = cls._get_current_price(symbol)
@@ -377,7 +377,7 @@ class Monitors:
             'amount': current_oi,
             'time': current_time,
             'delta': delta_pct,
-            'delta_15m': oi_trend_15m
+            'delta_1h': oi_trend_1h
         }
         if (current_oi * price) < MIN_OI_VALUE:
             return

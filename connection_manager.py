@@ -1,6 +1,7 @@
 # connection_manager.py
 import asyncio
 import time
+import gc
 from datetime import datetime
 
 import aiohttp
@@ -193,9 +194,12 @@ class MultiConnectionManager:
     async def _keep_alive_connection(self, url, name, callback_func):
         """
         一个健壮的、永不断的连接器
+        【修复】手动控制 ws + session 生命周期，finally 兜底关闭，杜绝 socket/connector 泄漏
         """
+        backoff = 5  # 指数退避，重连间隔 5→10→20→40→60 上限
         while True:
             session = None
+            ws = None
             try:
                 # 设置超时: 连接15秒超时, 心跳接收90秒超时
                 timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=90)
@@ -203,35 +207,48 @@ class MultiConnectionManager:
 
                 # heartbeat=20: 每20秒发一次心跳，防止僵尸连接
                 logger.info(f"🔵 [{name}] 正在连接...")
-                async with session.ws_connect(url, heartbeat=20) as ws:
-                    logger.info(f"🟢 [{name}] 连接成功!")
+                # 不用 async with，手动管理 ws 生命周期以便异常路径也走 close
+                ws = await session.ws_connect(url, heartbeat=20, autoclose=False)
+                logger.info(f"🟢 [{name}] 连接成功!")
+                backoff = 5  # 连接成功重置退避
 
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            payload = json.loads(msg.data)
-                            await callback_func(payload)
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            logger.error(f"🔴 [{name}] WS Error: {ws.exception()}")
-                            break
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        payload = json.loads(msg.data)
+                        await callback_func(payload)
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        logger.error(f"🔴 [{name}] WS Error: {ws.exception()}")
+                        break
 
             except asyncio.CancelledError:
                 # 这是一个正常的停止信号，不要报错
                 logger.info(f"🛑 [{name}] 任务被取消")
-                if session: await session.close()
-                return
+                raise  # 让上层清理
 
             except Exception as e:
                 logger.warning(f"⚠️ [{name}] 连接断开/异常: {e}")
 
             finally:
-                # 【至关重要】无论上面发生了什么，这里必须关闭 Session
-                # 这就是解决你"10小时后卡死"的关键
-                if session:
-                    await session.close()
-                    # logger.info(f"🧹 [{name}] 清理旧 Session 完成")
+                # 【根本修复】无论上面怎么走，必须强制关闭 ws 和 session，加超时防卡
+                if ws is not None:
+                    try:
+                        if not ws.closed:
+                            await asyncio.wait_for(ws.close(), timeout=2)
+                    except Exception as e:
+                        logger.debug(f"🧹 [{name}] ws.close 异常（可忽略）: {e}")
+                if session is not None:
+                    try:
+                        if not session.closed:
+                            await asyncio.wait_for(session.close(), timeout=2)
+                    except Exception as e:
+                        logger.debug(f"🧹 [{name}] session.close 异常（可忽略）: {e}")
+                # 主动 GC，回收已断开但还被引用的 socket 对象
+                gc.collect()
 
-            # 断开后，休息 5 秒再重连，防止死循环刷爆 CPU
-            await asyncio.sleep(5)
+            # 断开后，指数退避后再重连，防止雪崩
+            logger.info(f"⏳ [{name}] {backoff}秒后重连...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
     async def _connect_shard(self, url, shard_name):
