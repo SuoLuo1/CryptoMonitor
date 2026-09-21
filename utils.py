@@ -182,9 +182,29 @@ class TelegramNotifier:
 
     # --- 方法 A: 紧急发送 (直接进队列) ---
     async def send_urgent(self, msg):
-        # ✅ 保存警报到数据库
-        await self._save_alert_to_db(msg, priority='urgent')
-        
+        # ✅ 保存警报到数据库（返回 symbol 和 signal_type 用于次数叠加）
+        symbol, signal_type, price = await self._save_alert_to_db(msg, priority='urgent')
+
+        # 🔥 【新增】叠加今日次数信息（让老板一眼看到这条信号的关注度）
+        if symbol and signal_type and price:
+            count, first_price = self.get_today_signal_stats(symbol, signal_type)
+            # 首次已经在 INSERT 时算入 count=1，第二次 = 2
+            if count >= 2 and first_price:
+                # 算 vs 首次的涨跌幅
+                pct_vs_first = (price - first_price) / first_price * 100
+                # 紧急程度：次数越多越紧急
+                if count >= 5:
+                    fire_emoji = "🔥🔥🔥"
+                elif count >= 3:
+                    fire_emoji = "🔥🔥"
+                else:
+                    fire_emoji = "🔥"
+                # 插入到 <b>SYMBOL</b> 后面作为显眼标记
+                count_tag = f" <b>(今日第{count}次 {fire_emoji})</b>"
+                pct_tag = f"\n📊 vs首次: {pct_vs_first:+.2f}% (首次${first_price:.4f})"
+                msg = msg.replace(f"<b>{symbol}</b>", f"<b>{symbol}</b>{count_tag}", 1) + pct_tag
+                logger.info(f"🔥 [次数叠加] {symbol} {signal_type} 今日第{count}次, vs首次 {pct_vs_first:+.2f}%")
+
         logger.info(f"🔥 [send_urgent] 收到紧急消息：{msg[:50]}...")
         try:
             self.queue.put_nowait(msg)
@@ -265,11 +285,42 @@ class TelegramNotifier:
             """, (symbol, signal_type, msg, price, priority, beijing_time))
             conn.commit()
             conn.close()
-            
+
             print(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
-        
+            return symbol, signal_type, price
+
         except Exception as e:
             print(f"[❌DB] 保存警报失败：{e}")
+            return None, None, None
+
+    def get_today_signal_stats(self, symbol, signal_type):
+        """【新增】查询今日同币种同信号类型的累计次数 + 首次价格
+
+        返回: (count, first_price) 或 (0, None) 当首次报警
+        用于在报警消息中叠加"今日第N次"和"vs首次涨跌幅"
+        """
+        import sqlite3
+        try:
+            from datetime import datetime, timezone, timedelta
+            today_start = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d 00:00:00')
+            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*), MIN(price_at_alert)
+                FROM alerts
+                WHERE symbol = ?
+                  AND signal_type = ?
+                  AND priority = 'urgent'
+                  AND timestamp >= ?
+            """, (symbol, signal_type, today_start))
+            row = cursor.fetchone()
+            conn.close()
+            count = row[0] or 0
+            first_price = row[1] if count > 0 else None
+            return count, first_price
+        except Exception as e:
+            print(f"[❌DB] 查询今日统计失败：{e}")
+            return 0, None
 
 
     async def send_buffered(self, msg):
