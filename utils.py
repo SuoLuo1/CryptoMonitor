@@ -182,28 +182,13 @@ class TelegramNotifier:
 
     # --- 方法 A: 紧急发送 (直接进队列) ---
     async def send_urgent(self, msg):
-        # ✅ 保存警报到数据库（返回 symbol 和 signal_type 用于次数叠加）
+        # ✅ 保存警报到数据库
         symbol, signal_type, price = await self._save_alert_to_db(msg, priority='urgent')
 
-        # 🔥 【新增】叠加今日次数信息（让老板一眼看到这条信号的关注度）
+        # 🔥 【新版】拼装 Top 排行 + 当前信号（全局视角，老板一眼看全市场热点）
         if symbol and signal_type and price:
-            count, first_price = self.get_today_signal_stats(symbol, signal_type)
-            # 首次已经在 INSERT 时算入 count=1，第二次 = 2
-            if count >= 2 and first_price:
-                # 算 vs 首次的涨跌幅
-                pct_vs_first = (price - first_price) / first_price * 100
-                # 紧急程度：次数越多越紧急
-                if count >= 5:
-                    fire_emoji = "🔥🔥🔥"
-                elif count >= 3:
-                    fire_emoji = "🔥🔥"
-                else:
-                    fire_emoji = "🔥"
-                # 插入到 <b>SYMBOL</b> 后面作为显眼标记
-                count_tag = f" <b>(今日第{count}次 {fire_emoji})</b>"
-                pct_tag = f"\n📊 vs首次: {pct_vs_first:+.2f}% (首次${first_price:.4f})"
-                msg = msg.replace(f"<b>{symbol}</b>", f"<b>{symbol}</b>{count_tag}", 1) + pct_tag
-                logger.info(f"🔥 [次数叠加] {symbol} {signal_type} 今日第{count}次, vs首次 {pct_vs_first:+.2f}%")
+            final_msg = self._build_top_ranked_msg(symbol, signal_type, msg)
+            msg = final_msg
 
         logger.info(f"🔥 [send_urgent] 收到紧急消息：{msg[:50]}...")
         try:
@@ -215,6 +200,121 @@ class TelegramNotifier:
             print("[DROP] 紧急队列满")
         except Exception as e:
             logger.error(f"❌ [send_urgent] 异常：{e}", exc_info=True)
+
+    def _build_top_ranked_msg(self, current_symbol, current_signal_type, current_msg):
+        """
+        【新版】构建带今日 Top 排行的推送消息
+
+        格式：
+        ══════════════════════════════
+        📊 今日所有信号 Top (14:32) · 共 23 个币
+        ══════════════════════════════
+        1. CHRUSDT      8次🔥🔥🔥  🚀 +14.2%
+        2. MUBARAKUSDT  5次🔥🔥🔥  🚀 +8.5%
+        ...
+        ────── 🚀 当前信号：JOEUSDT ──────
+        🚀 暴涨 JOEUSDT (3m放量)
+        ...
+        """
+        from datetime import datetime, timezone, timedelta
+        BJ_TZ = timezone(timedelta(hours=8))
+        now_str = datetime.now(BJ_TZ).strftime('%H:%M')
+
+        # 1. 查今日所有 symbol 排行
+        top_list = self.get_today_symbols_top(limit=100)
+
+        # 2. 渲染顶部
+        header = (
+            "═══════════════════════════════\n"
+            f"📊 今日所有信号 Top ({now_str}) · 共 {len(top_list)} 个币\n"
+            "═══════════════════════════════\n"
+        )
+
+        # 3. 渲染排行
+        lines = []
+        for i, (sym, cnt, first_p, latest_p) in enumerate(top_list, 1):
+            # 🔥 等级：第1次无标记，第2-3次 🔥，第4+ 次 🔥🔥🔥
+            if cnt >= 4:
+                fire = "🔥🔥🔥"
+            elif cnt >= 2:
+                fire = "🔥"
+            else:
+                fire = ""
+
+            # 主方向 + 涨跌幅：仅当 ≥2 次才有意义（1次时首次就是自己，没比较）
+            if cnt >= 2 and latest_p is not None and first_p and first_p > 0:
+                if latest_p > first_p:
+                    main_dir = "🚀"
+                    pct_str = f"+{(latest_p - first_p) / first_p * 100:.2f}%"
+                elif latest_p < first_p:
+                    main_dir = "🩸"
+                    pct_str = f"{(latest_p - first_p) / first_p * 100:.2f}%"
+                else:
+                    main_dir = "➖"
+                    pct_str = "持平"
+            else:
+                main_dir = ""
+                pct_str = ""
+
+            # 当前信号标记
+            current_mark = " ◀" if sym == current_symbol else ""
+
+            line = f"{i:2d}. {sym:13s} {cnt}次{fire:6s} {main_dir} {pct_str}{current_mark}"
+            lines.append(line)
+
+        # 4. 分隔 + 当前信号
+        separator = f"\n────── {current_signal_type} 当前信号：{current_symbol} ──────\n"
+
+        return header + "\n".join(lines) + separator + current_msg
+
+    def get_today_symbols_top(self, limit=100):
+        """
+        【新版】查询今日所有 (symbol) 聚合排行
+
+        返回: [(symbol, total_count, first_price, latest_price), ...]
+        按 total_count DESC, last_alert DESC 排序
+
+        注意：latest_price 必须取时间戳最大那一行的价格，不能用 MIN/MAX 替代
+        """
+        import sqlite3
+        from datetime import datetime, timezone, timedelta
+        BJ_TZ = timezone(timedelta(hours=8))
+        today_start = datetime.now(BJ_TZ).strftime('%Y-%m-%d 00:00:00')
+
+        try:
+            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+            cursor = conn.cursor()
+            # 先取最新一次的时间戳，再 JOIN 回去取价格
+            cursor.execute("""
+                WITH last_per_symbol AS (
+                    SELECT symbol, MAX(timestamp) as last_ts
+                    FROM alerts
+                    WHERE priority = 'urgent' AND timestamp >= ?
+                    GROUP BY symbol
+                )
+                SELECT a.symbol,
+                       COUNT(*) as cnt,
+                       MIN(a.price_at_alert) as first_price,
+                       (SELECT price_at_alert FROM alerts a2
+                        WHERE a2.symbol = a.symbol
+                          AND a2.priority = 'urgent'
+                          AND a2.timestamp >= ?
+                          AND a2.timestamp = l.last_ts
+                        LIMIT 1) as latest_price,
+                       l.last_ts as last_alert
+                FROM alerts a
+                JOIN last_per_symbol l ON a.symbol = l.symbol
+                WHERE a.priority = 'urgent' AND a.timestamp >= ?
+                GROUP BY a.symbol
+                ORDER BY cnt DESC, last_alert DESC
+                LIMIT ?
+            """, (today_start, today_start, today_start, limit))
+            rows = cursor.fetchall()
+            conn.close()
+            return [(r[0], r[1], r[2], r[3]) for r in rows]
+        except Exception as e:
+            logger.error(f"❌ [get_today_symbols_top] 查询失败：{e}", exc_info=True)
+            return []
 
     # --- 方法 B: 缓冲发送 (进篮子) ---
 
@@ -336,14 +436,19 @@ class TelegramNotifier:
     async def send_chart(self, symbol, timeframe="15m", caption=""):
         """
         拉取 K 线 -> 后台画图 -> 发送图片
+        三层 try/except 防护，单条图表失败绝不影响主进程：
+          内层：拉 K 线/画图 抛出的业务异常
+          中层：上传图片时的网络超时/连接错误
+          外层：兜住 CancelledError/Exception，防止拖死 asyncio 主循环
         """
         if not self.session: return
 
+        # ---------- 内层：拉 K 线 + 画图 ----------
         try:
             # 1. 临时拉取 K 线（为了均线准确，拉 200 根）
             url = f"{BINANCE_HTTP_FUTURES}/fapi/v1/klines"
             params = {'symbol': symbol, 'interval': timeframe, 'limit': 200}
-            
+
             # 使用限流器
             from shared.binance_limiter import limited_get
             resp = limited_get(
@@ -351,7 +456,7 @@ class TelegramNotifier:
                 params=params,
                 endpoint="klines",
             )
-            
+
             if not resp:
                 logger.warning(f"❌ 拉 K 线失败：{symbol}")
                 return
@@ -375,7 +480,20 @@ class TelegramNotifier:
 
             if not img_buf: return
 
-            # 4. 上传图片
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            # 拉 K 线 / 画图阶段的网络超时 —— 单条失败，不影响其它图表
+            logger.error(f"❌ [{symbol}] 拉K线/画图阶段网络异常：{type(e).__name__}: {e}")
+            return
+        except asyncio.CancelledError:
+            # 上层 task 取消（如优雅退出）—— 必须 re-raise，不能吞
+            raise
+        except Exception as e:
+            # 其它业务异常（数据解析、画图崩溃等）—— 隔离在本条图表内
+            logger.error(f"❌ [{symbol}] 拉K线/画图阶段出错：{e}", exc_info=True)
+            return
+
+        # ---------- 中层：上传图片到 Telegram ----------
+        try:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
             data = aiohttp.FormData()
             data.add_field('chat_id', str(TG_CHAT_ID))
@@ -384,10 +502,17 @@ class TelegramNotifier:
 
             async with self.session.post(url, data=data, timeout=30) as resp:
                 if resp.status != 200:
-                    logger.error(f"❌ 发图失败：{await resp.text()}")
+                    logger.error(f"❌ [{symbol}] 发图失败：{await resp.text()}")
 
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            # Telegram 上传超时/断连 —— 最常见的崩溃源，单独兜住
+            logger.error(f"❌ [{symbol}] 发图阶段网络异常：{type(e).__name__}: {e}")
+        except asyncio.CancelledError:
+            # 优雅退出信号，必须 re-raise
+            raise
         except Exception as e:
-            logger.error(f"❌ 发送图表流程出错：{e}", exc_info=True)
+            # 兜底：其它未知错误（编码、磁盘满等）—— 绝不外冒
+            logger.error(f"❌ [{symbol}] 发图阶段出错：{e}", exc_info=True)
 
     # --- 任务 1: 紧急消息发送循环---
     async def _urgent_worker(self):
