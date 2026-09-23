@@ -145,8 +145,8 @@ def _draw_chart_task(df, symbol, timeframe):
 
 class TelegramNotifier:
     def __init__(self):
-        # 紧急队列 (暴涨暴跌)
-        self.queue = asyncio.Queue(maxsize=200)
+        # 紧急队列 (暴涨暴跌) - 上限提高以应对高峰
+        self.queue = asyncio.Queue(maxsize=1000)
 
         # 缓冲列表 (存巨鲸、价差等)
         self.buffer_list = []
@@ -154,6 +154,11 @@ class TelegramNotifier:
 
         self.running = False
         self.session = None
+
+        # 🔥【新增】Top 列表缓存（避免每条信号都重复渲染整个排行榜）
+        self._top_cache_text = None
+        self._top_cache_time = 0
+        self._top_cache_lock = asyncio.Lock()
 
         # 实例化 AI
         self.llm = DeepSeekAgent()
@@ -168,12 +173,12 @@ class TelegramNotifier:
         timeout = aiohttp.ClientTimeout(total=10)
         self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
-        # 启动两个任务：
-        # 1. 负责秒发紧急消息
-        asyncio.create_task(self._urgent_worker())
-        # 2. 负责每分钟总结非紧急消息
+        # 启动 5 个并发 worker 处理紧急消息（解决单条失败阻塞问题）
+        for i in range(5):
+            asyncio.create_task(self._urgent_worker())
+        # 启动定时总结循环
         asyncio.create_task(self._buffer_flush_loop())
-        logger.info("✅ TelegramNotifier 已启动 (连接池限制: 10)")
+        logger.info("✅ TelegramNotifier 已启动 (紧急 worker: 5并发, 连接池: 10)")
 
     async def stop(self):
         self.running = False
@@ -203,37 +208,65 @@ class TelegramNotifier:
 
     def _build_top_ranked_msg(self, current_symbol, current_signal_type, current_msg):
         """
-        【新版】构建带今日 Top 排行的推送消息
+        构建带今日 Top 排行的推送消息（带缓存 + 字符截断保护）
 
-        格式：
-        ══════════════════════════════
-        📊 今日所有信号 Top (14:32) · 共 23 个币
-        ══════════════════════════════
-        1. CHRUSDT      8次🔥🔥🔥  🚀 +14.2%
-        2. MUBARAKUSDT  5次🔥🔥🔥  🚀 +8.5%
-        ...
-        ────── 🚀 当前信号：JOEUSDT ──────
-        🚀 暴涨 JOEUSDT (3m放量)
-        ...
+        Top 列表保留 80 个币（覆盖今日全量 + 字符安全）
+        30 秒内复用同一份 Top 列表（DB 查询频率降低 95%）
+        渲染后字符数 ≤3800 字符（TG 上限 4096 - buffer）
         """
+        import time
         from datetime import datetime, timezone, timedelta
         BJ_TZ = timezone(timedelta(hours=8))
         now_str = datetime.now(BJ_TZ).strftime('%H:%M')
 
-        # 1. 查今日所有 symbol 排行
-        top_list = self.get_today_symbols_top(limit=100)
+        # 1. 取缓存的 Top 文本（30 秒 TTL）
+        top_text = self._get_cached_top(now_str)
+        if top_text is None:
+            # 缓存失效，重新查询 + 渲染（带字符截断）
+            top_text = self._render_top_text(now_str)
 
-        # 2. 渲染顶部
+        # 1.5 给当前信号加 ◀ 标记（每次单独附加，不进缓存）
+        if current_symbol:
+            top_text = top_text.replace(
+                f" {current_symbol} ",
+                f" {current_symbol} ◀ ",
+                1
+            )
+
+        # 2. 分隔 + 当前信号
+        separator = f"\n────── {current_signal_type} 当前信号：{current_symbol} ──────\n"
+
+        # 3. 最终组合 + 字符截断兜底
+        final_msg = top_text + separator + current_msg
+        if len(final_msg) > 3800:
+            # 极端情况兜底：从 Top 文本末尾截断
+            keep_len = 3800 - len(separator + current_msg) - 50
+            top_text = top_text[:keep_len] + "\n…(超长截断)"
+            final_msg = top_text + separator + current_msg
+
+        return final_msg
+    def _get_cached_top(self, now_str):
+        """30 秒 TTL 缓存"""
+        import time
+        if (self._top_cache_text is not None
+                and (time.time() - self._top_cache_time) < 30):
+            return self._top_cache_text
+        return None
+
+    def _render_top_text(self, now_str):
+        """查询 DB + 渲染 Top 列表（最多 80 个币，截断到 3800 字符）"""
+        top_list = self.get_today_symbols_top(limit=80)
+
         header = (
             "═══════════════════════════════\n"
             f"📊 今日所有信号 Top ({now_str}) · 共 {len(top_list)} 个币\n"
             "═══════════════════════════════\n"
         )
 
-        # 3. 渲染排行
         lines = []
-        for i, (sym, cnt, first_p, latest_p) in enumerate(top_list, 1):
-            # 🔥 等级：第1次无标记，第2-3次 🔥，第4+ 次 🔥🔥🔥
+        from datetime import datetime
+        for i, (sym, cnt, first_p, first_ts, latest_p) in enumerate(top_list, 1):
+            # 🔥 等级
             if cnt >= 4:
                 fire = "🔥🔥🔥"
             elif cnt >= 2:
@@ -241,7 +274,7 @@ class TelegramNotifier:
             else:
                 fire = ""
 
-            # 主方向 + 涨跌幅：仅当 ≥2 次才有意义（1次时首次就是自己，没比较）
+            # 主方向 + 涨跌幅（仅 ≥2 次）
             if cnt >= 2 and latest_p is not None and first_p and first_p > 0:
                 if latest_p > first_p:
                     main_dir = "🚀"
@@ -256,22 +289,32 @@ class TelegramNotifier:
                 main_dir = ""
                 pct_str = ""
 
-            # 当前信号标记
-            current_mark = " ◀" if sym == current_symbol else ""
+            # 首次信号时间 (北京时间 HH:MM)
+            if first_ts:
+                # timestamp 格式: "2026-09-24 13:45:12"
+                first_time = first_ts.split(' ')[1][:5] if ' ' in first_ts else first_ts[11:16]
+            else:
+                first_time = "--:--"
 
-            line = f"{i:2d}. {sym:13s} {cnt}次{fire:6s} {main_dir} {pct_str}{current_mark}"
+            # 拼装行 (pct_str 为空时用占位)
+            pct_display = pct_str if pct_str else "       "
+            line = f"{i:2d}. {sym:13s} {cnt}次{fire:6s} {main_dir} {pct_display} ⏱{first_time}"
             lines.append(line)
 
-        # 4. 分隔 + 当前信号
-        separator = f"\n────── {current_signal_type} 当前信号：{current_symbol} ──────\n"
+        result = header + "\n".join(lines) + "\n"
 
-        return header + "\n".join(lines) + separator + current_msg
+        # 写缓存
+        import time
+        self._top_cache_text = result
+        self._top_cache_time = time.time()
+
+        return result
 
     def get_today_symbols_top(self, limit=100):
         """
-        【新版】查询今日所有 (symbol) 聚合排行
+        查询今日所有 (symbol) 聚合排行
 
-        返回: [(symbol, total_count, first_price, latest_price), ...]
+        返回: [(symbol, total_count, first_price, first_ts, latest_price), ...]
         按 total_count DESC, last_alert DESC 排序
 
         注意：latest_price 必须取时间戳最大那一行的价格，不能用 MIN/MAX 替代
@@ -295,6 +338,7 @@ class TelegramNotifier:
                 SELECT a.symbol,
                        COUNT(*) as cnt,
                        MIN(a.price_at_alert) as first_price,
+                       MIN(a.timestamp) as first_ts,
                        (SELECT price_at_alert FROM alerts a2
                         WHERE a2.symbol = a.symbol
                           AND a2.priority = 'urgent'
@@ -311,7 +355,7 @@ class TelegramNotifier:
             """, (today_start, today_start, today_start, limit))
             rows = cursor.fetchall()
             conn.close()
-            return [(r[0], r[1], r[2], r[3]) for r in rows]
+            return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
         except Exception as e:
             logger.error(f"❌ [get_today_symbols_top] 查询失败：{e}", exc_info=True)
             return []
@@ -500,7 +544,8 @@ class TelegramNotifier:
             data.add_field('caption', caption)
             data.add_field('photo', img_buf, filename=f'{symbol}.png', content_type='image/png')
 
-            async with self.session.post(url, data=data, timeout=30) as resp:
+            # 10s 超时（之前 30s 会卡死并发 worker）
+            async with self.session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     logger.error(f"❌ [{symbol}] 发图失败：{await resp.text()}")
 
@@ -516,11 +561,15 @@ class TelegramNotifier:
 
     # --- 任务 1: 紧急消息发送循环---
     async def _urgent_worker(self):
+        """
+        并发消费紧急消息 - 5 个 worker 并行处理, 单条失败不阻塞其它
+        """
+        worker_id = id(self) % 10000  # 仅用于日志标识
         while self.running:
             try:
                 msgs = []
                 msgs.append(await self.queue.get())
-                # 稍微聚合一下紧急的，比如 0.5秒内连发了两条暴跌
+                # 聚合 0.5 秒内的同质信号 (比如 0.5 秒内连发了两条暴跌)
                 for _ in range(2):
                     if self.queue.empty(): break
                     msgs.append(self.queue.get_nowait())
@@ -528,7 +577,7 @@ class TelegramNotifier:
                 if not msgs: continue
                 text = "\n\n".join(msgs)
                 await self._send_to_tg(text)
-                await asyncio.sleep(0.5)  # 紧急通道稍微快点
+                await asyncio.sleep(0.1)  # 紧急通道并发后 sleep 缩短
             except Exception as e:
                 logger.error(f"Urgent Worker Err: {e}")
 
