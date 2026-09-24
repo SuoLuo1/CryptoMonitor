@@ -235,8 +235,14 @@ class TelegramNotifier:
         )
 
         # 3. 渲染排行
+        # 🐾 加首次信号时间 ⏱HH:MM (区分凌晨旧信号 vs 刚冒头的新机会)
+        # 🐾 长度保护: TG 上限 4096, 加时间戳后100币必超, 按预算截断
+        MSG_BUDGET = 3800  # 给分隔符+当前信号正文留 buffer
         lines = []
-        for i, (sym, cnt, first_p, latest_p) in enumerate(top_list, 1):
+        used_len = len(header)
+        shown = 0
+        current_line = None  # 当前信号的币, 单独保底
+        for i, (sym, cnt, first_p, latest_p, first_ts) in enumerate(top_list, 1):
             # 🔥 等级：第1次无标记，第2-3次 🔥，第4+ 次 🔥🔥🔥
             if cnt >= 4:
                 fire = "🔥🔥🔥"
@@ -244,6 +250,9 @@ class TelegramNotifier:
                 fire = "🔥"
             else:
                 fire = ""
+
+            # ⏱ 首次信号时间 (HH:MM)
+            first_time = first_ts[11:16] if first_ts and len(first_ts) >= 16 else "--:--"
 
             # 主方向 + 涨跌幅：仅当 ≥2 次才有意义（1次时首次就是自己，没比较）
             if cnt >= 2 and latest_p is not None and first_p and first_p > 0:
@@ -263,8 +272,29 @@ class TelegramNotifier:
             # 当前信号标记
             current_mark = " ◀" if sym == current_symbol else ""
 
-            line = f"{i:2d}. {sym:13s} {cnt}次{fire:6s} {main_dir} {pct_str}{current_mark}"
-            lines.append(line)
+            line = f"{i:2d}. {sym:13s} ⏱{first_time} {cnt}次{fire:6s} {main_dir} {pct_str}{current_mark}"
+
+            if sym == current_symbol:
+                current_line = line  # 保底: 当前信号行不参与截断
+
+            # 长度预算控制 (预留 separator + 省略提示 ≈ 250 字符)
+            if used_len + len(line) + 1 <= MSG_BUDGET - 250 or (current_msg is None):
+                lines.append(line)
+                used_len += len(line) + 1
+                shown += 1
+            elif sym == current_symbol:
+                lines.append(line)
+                used_len += len(line) + 1
+                shown += 1
+                current_line = None  # 已入列, 不用保底
+
+        # 被截断的剩余币数
+        omitted = len(top_list) - shown
+        if omitted > 0:
+            note = f"... 还有 {omitted} 个币未显示"
+            if current_line:  # 当前信号的币被截断了, 补在最后
+                note += f"\n{current_line}"
+            lines.append(note)
 
         # 4. 分隔 + 当前信号
         separator = f"\n────── {current_signal_type} 当前信号：{current_symbol} ──────\n"
@@ -275,10 +305,15 @@ class TelegramNotifier:
         """
         【新版】查询今日所有 (symbol) 聚合排行
 
-        返回: [(symbol, total_count, first_price, latest_price), ...]
+        返回: [(symbol, total_count, first_price, latest_price, first_ts), ...]
         按 total_count DESC, last_alert DESC 排序
 
-        注意：latest_price 必须取时间戳最大那一行的价格，不能用 MIN/MAX 替代
+        🐾 修复两个价格 bug (实测案例):
+        1. first_price 原用 MIN(price_at_alert) 取到的是"最低价"不是"首次价"
+           → TAKEUSDT 实际 0.11094 跌到 0.06525 (-41%), 却因 MIN==latest 显示"➖持平"
+        2. latest_price 原取"时间戳最大那行", 但该行 price_at_alert 可能为 NULL
+           (🚀暴涨 消息格式无"现价："字段) → JOEUSDT 涨 9% 却整行空白
+        → 现在两个价格都按时间序取"最近的非 NULL 价格"
         """
         import sqlite3
         from datetime import datetime, timezone, timedelta
@@ -288,34 +323,41 @@ class TelegramNotifier:
         try:
             conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
             cursor = conn.cursor()
-            # 先取最新一次的时间戳，再 JOIN 回去取价格
             cursor.execute("""
-                WITH last_per_symbol AS (
-                    SELECT symbol, MAX(timestamp) as last_ts
+                WITH per_symbol AS (
+                    SELECT symbol,
+                           MIN(timestamp) as first_ts,
+                           MAX(timestamp) as last_ts
                     FROM alerts
                     WHERE priority = 'urgent' AND timestamp >= ?
                     GROUP BY symbol
                 )
                 SELECT a.symbol,
                        COUNT(*) as cnt,
-                       MIN(a.price_at_alert) as first_price,
-                       (SELECT price_at_alert FROM alerts a2
-                        WHERE a2.symbol = a.symbol
-                          AND a2.priority = 'urgent'
-                          AND a2.timestamp >= ?
-                          AND a2.timestamp = l.last_ts
-                        LIMIT 1) as latest_price,
-                       l.last_ts as last_alert
+                       (SELECT price_at_alert FROM alerts f1
+                          WHERE f1.symbol = a.symbol
+                            AND f1.priority = 'urgent'
+                            AND f1.timestamp >= ?
+                            AND f1.price_at_alert IS NOT NULL
+                          ORDER BY f1.timestamp ASC LIMIT 1) as first_price,
+                       (SELECT price_at_alert FROM alerts f2
+                          WHERE f2.symbol = a.symbol
+                            AND f2.priority = 'urgent'
+                            AND f2.timestamp >= ?
+                            AND f2.price_at_alert IS NOT NULL
+                          ORDER BY f2.timestamp DESC LIMIT 1) as latest_price,
+                       p.first_ts as first_ts,
+                       p.last_ts as last_alert
                 FROM alerts a
-                JOIN last_per_symbol l ON a.symbol = l.symbol
+                JOIN per_symbol p ON a.symbol = p.symbol
                 WHERE a.priority = 'urgent' AND a.timestamp >= ?
                 GROUP BY a.symbol
                 ORDER BY cnt DESC, last_alert DESC
                 LIMIT ?
-            """, (today_start, today_start, today_start, limit))
+            """, (today_start, today_start, today_start, today_start, limit))
             rows = cursor.fetchall()
             conn.close()
-            return [(r[0], r[1], r[2], r[3]) for r in rows]
+            return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
         except Exception as e:
             logger.error(f"❌ [get_today_symbols_top] 查询失败：{e}", exc_info=True)
             return []
