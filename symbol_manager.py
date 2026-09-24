@@ -2,7 +2,7 @@
 import aiohttp
 import logging
 from config import BINANCE_HTTP_FUTURES, QUOTE_ASSET, MIN_VOLUME_24H, BLACKLIST, MIN_VOLUME_TG, MIN_VOLUME_AI
-from shared.binance_limiter import limited_get
+from shared.binance_limiter import limited_get_async
 
 logger = logging.getLogger("SymbolMgr")
 
@@ -10,6 +10,8 @@ logger = logging.getLogger("SymbolMgr")
 async def get_active_symbols(session):
     """
     通过 exchangeInfo (获取合法名单) + ticker (获取流动性) 双重过滤
+    🐾 修复: 原 limited_get 是同步 requests, 雷达每5分钟调用一次会冻结事件循环
+    (ticker/24hr 响应很大, 解析+网络耗时数秒), 改用异步版
     """
     # 1. 获取所有"户籍"信息
     info_url = f"{BINANCE_HTTP_FUTURES}/fapi/v1/exchangeInfo"
@@ -20,11 +22,10 @@ async def get_active_symbols(session):
 
     try:
         # --- 第一步：查户口 (exchangeInfo) ---
-        info_resp = limited_get(info_url, endpoint="exchangeInfo")
-        if not info_resp:
+        info_data = await limited_get_async(session, info_url, weight=1, timeout=15)
+        if not info_data:
             logger.error("ExchangeInfo 请求失败")
             return {"all": [], "vip": []}
-        info_data = info_resp.json()
         
         for s in info_data['symbols']:
             # 【核心过滤参数】
@@ -40,11 +41,10 @@ async def get_active_symbols(session):
         logger.info(f"Binance 在架活跃永续合约共：{len(active_perpetuals)} 个")
 
         # --- 第二步：查流水 (ticker) ---
-        ticker_resp = limited_get(ticker_url, endpoint="ticker/24hr")
-        if not ticker_resp:
+        ticker_data = await limited_get_async(session, ticker_url, weight=40, timeout=15)
+        if not ticker_data:
             logger.error("Ticker 请求失败")
             return {"all": [], "vip": []}
-        ticker_data = ticker_resp.json()
         
         tg_symbols = []  # 对应 500w+
         vip_symbols = []  # 对应 1000w+

@@ -10,7 +10,7 @@ import logging
 
 import symbol_manager
 from config import BINANCE_WS_FUTURES_COMBINED, BINANCE_WS_FUTURES_RAW, BINANCE_HTTP_FUTURES
-from shared.binance_limiter import limited_get
+from shared.binance_limiter import limited_get, limited_get_async
 from monitors import Monitors
 
 logger = logging.getLogger("ConnMgr")
@@ -283,7 +283,9 @@ class MultiConnectionManager:
                     except Exception as e:
                         logger.debug(f"🧹 [{name}] session.close 异常（可忽略）: {e}")
                 # 主动 GC，回收已断开但还被引用的 socket 对象
-                gc.collect()
+                # 🐾 修复: 去掉 gc.collect() —— 全量GC在多连接场景是阻塞放大器
+                # (53条连接每90秒各断一次, 每次GC冻结事件循环数百ms, 恶性循环)
+                # CPython 引用计数已足够回收 socket, 无需强制全量GC
 
             # 断开后，指数退避后再重连，防止雪崩
             logger.info(f"⏳ [{name}] {backoff}秒后重连...")
@@ -361,15 +363,18 @@ class MultiConnectionManager:
     async def _fetch_with_sem(self, sem, session, url, symbol):
         async with sem:
             try:
-                # 使用限流器（从响应头读取权重）
-                resp = limited_get(
+                # 🐾 修复: 原 limited_get 是同步 requests, 在 async 里调用会冻结
+                # 整个事件循环 (526个请求串行阻塞50~100秒 → 所有WS心跳超时被
+                # aiohttp集体abort → close_code=1006无限重连)。
+                # 改用异步版, Semaphore(5) 才能真并发, 几秒跑完零阻塞。
+                data = await limited_get_async(
+                    session,
                     url,
                     params={"symbol": symbol},
-                    endpoint="openInterest",
+                    weight=1,
+                    timeout=10,
                 )
-                if resp:
-                    return resp.json()
-                return None
+                return data
             except Exception:
                 pass
             return None

@@ -141,7 +141,46 @@ def limited_get(url: str, weight: int = 2, endpoint: str = "", timeout: int = 10
 
 try:
     import aiohttp
-    
+
+    async def limited_get_async(session, url: str, params=None, weight: int = 1,
+                                timeout: float = 10.0, **kwargs):
+        """
+        🐾 带限流的异步 GET —— 绝不阻塞事件循环!
+
+        与 limited_get (同步 requests 版) 的区别:
+        - limited_get 在 async 函数里调用会把整个事件循环冻住
+          (实测: OI 轮询 526 个同步请求串行阻塞 50~100 秒,
+           导致所有 WS 心跳超时被 aiohttp 集体 abort → close_code=1006 无限重连)
+        - 本函数走 aiohttp, 与 Semaphore 配合实现真并发
+
+        返回: 解析后的 JSON (dict/list), 失败返回 None
+        """
+        # 检查限流 (被 ban / 权重超限 → 跳过)
+        if not limiter.can_request(weight):
+            return None
+
+        try:
+            req_timeout = aiohttp.ClientTimeout(total=timeout)
+            async with session.get(url, params=params, timeout=req_timeout, **kwargs) as response:
+                # 🎯 从响应头读取全局权重
+                used_weight = response.headers.get('X-MBX-USED-WEIGHT-1M')
+                if used_weight:
+                    limiter.update_weight(int(used_weight))
+
+                # 418 = IP 被封禁
+                if response.status == 418:
+                    retry_after = response.headers.get('Retry-After', '300')
+                    limiter.set_blocked(int(retry_after))
+                    return None
+
+                if response.status != 200:
+                    return None
+
+                return await response.json()
+
+        except Exception:
+            return None
+
     class LimitedSession:
         """带限流的 aiohttp ClientSession 包装器"""
         

@@ -182,12 +182,16 @@ class TelegramNotifier:
 
     # --- 方法 A: 紧急发送 (直接进队列) ---
     async def send_urgent(self, msg):
-        # ✅ 保存警报到数据库
+        # ✅ 保存警报到数据库 (内部已走线程池, 不阻塞事件循环)
         symbol, signal_type, price = await self._save_alert_to_db(msg, priority='urgent')
 
         # 🔥 【新版】拼装 Top 排行 + 当前信号（全局视角，老板一眼看全市场热点）
         if symbol and signal_type and price:
-            final_msg = self._build_top_ranked_msg(symbol, signal_type, msg)
+            # 🐾 修复: Top排行要查sqlite, 挪到线程池执行
+            loop = asyncio.get_event_loop()
+            final_msg = await loop.run_in_executor(
+                None, self._build_top_ranked_msg, symbol, signal_type, msg
+            )
             msg = final_msg
 
         logger.info(f"🔥 [send_urgent] 收到紧急消息：{msg[:50]}...")
@@ -377,17 +381,24 @@ class TelegramNotifier:
                     price = float(price_match.group(1))
             
             # 写入数据库 (使用北京时间)
+            # 🐾 修复: sqlite 同步写挪到线程池, 不阻塞事件循环
             from datetime import datetime, timezone, timedelta
             beijing_time = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
-            
-            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (symbol, signal_type, msg, price, priority, beijing_time))
-            conn.commit()
-            conn.close()
+
+            def _db_insert():
+                conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (symbol, signal_type, msg, price, priority, beijing_time))
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _db_insert)
 
             print(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
             return symbol, signal_type, price
@@ -452,18 +463,20 @@ class TelegramNotifier:
             url = f"{BINANCE_HTTP_FUTURES}/fapi/v1/klines"
             params = {'symbol': symbol, 'interval': timeframe, 'limit': 200}
 
-            # 使用限流器
-            from shared.binance_limiter import limited_get
-            resp = limited_get(
+            # 🐾 修复: 原 limited_get 是同步 requests, 会冻结事件循环
+            # (每次信号触发 send_chart 都阻塞一次)。改用异步版。
+            from shared.binance_limiter import limited_get_async
+            raw_data = await limited_get_async(
+                self.session,
                 url,
                 params=params,
-                endpoint="klines",
+                weight=2,
+                timeout=10,
             )
 
-            if not resp:
+            if not raw_data:
                 logger.warning(f"❌ 拉 K 线失败：{symbol}")
                 return
-            raw_data = resp.json()
 
             # 2. 转换数据
             df = pd.DataFrame(raw_data, columns=[
