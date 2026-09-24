@@ -200,6 +200,13 @@ class MultiConnectionManager:
         while True:
             session = None
             ws = None
+            # 🔍 诊断埋点: 追踪本次连接生命周期, 静默断开时输出 close_code 全链路信息
+            conn_start = time.time()
+            last_msg_type = None       # async for 收到的最后一个帧类型
+            last_data_at = None        # 最后一条 TEXT 数据时间
+            msg_count = 0              # TEXT 消息计数
+            exit_reason = "loop_exit"  # loop_exit=静默退出 / break_error / exception
+            exc_info_str = ""
             try:
                 # 设置超时: 连接15秒超时, 心跳接收90秒超时
                 timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=90)
@@ -213,10 +220,23 @@ class MultiConnectionManager:
                 backoff = 5  # 连接成功重置退避
 
                 async for msg in ws:
+                    last_msg_type = msg.type
                     if msg.type == aiohttp.WSMsgType.TEXT:
-                        payload = json.loads(msg.data)
-                        await callback_func(payload)
+                        msg_count += 1
+                        last_data_at = time.time()
+                        try:
+                            payload = json.loads(msg.data)
+                            await callback_func(payload)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as cb_err:
+                            # 🐾 防御: 单条消息的 callback 异常不再杀整条 WS 连接
+                            # (根因案例: _save_alert_to_db 裸return导致解包TypeError,
+                            #  炸穿 process_kline → async for → 断线 → 无限重连)
+                            logger.warning(f"⚠️ [{name}] callback 异常已隔离: {type(cb_err).__name__}: {cb_err}")
                     elif msg.type == aiohttp.WSMsgType.ERROR:
+                        exit_reason = "break_error"
+                        exc_info_str = f"ws.exception={ws.exception()}"
                         logger.error(f"🔴 [{name}] WS Error: {ws.exception()}")
                         break
 
@@ -226,9 +246,29 @@ class MultiConnectionManager:
                 raise  # 让上层清理
 
             except Exception as e:
+                exit_reason = "exception"
+                exc_info_str = f"{type(e).__name__}: {e}"
                 logger.warning(f"⚠️ [{name}] 连接断开/异常: {e}")
 
             finally:
+                # 🔍 诊断日志: 无论哪种退出路径, 都输出 close_code 全链路信息
+                # close_code 含义: 1000=正常关闭 1001=服务端GoingAway 1006=TCP异常断
+                #   1008=违规踢线 1011=服务端内部错误 None=没收到CLOSE帧
+                try:
+                    now = time.time()
+                    uptime = now - conn_start
+                    data_gap = (now - last_data_at) if last_data_at else -1
+                    logger.warning(
+                        f"🔍 [{name}] 断线诊断: reason={exit_reason} "
+                        f"close_code={ws.close_code if ws else '?'} "
+                        f"ws.closed={ws.closed if ws else '?'} "
+                        f"last_msg_type={last_msg_type} "
+                        f"uptime={uptime:.1f}s msgs={msg_count} "
+                        f"距最后数据={data_gap:.1f}s exc=({exc_info_str})"
+                    )
+                except Exception as diag_err:
+                    logger.debug(f"🔍 [{name}] 诊断日志自身出错: {diag_err}")
+
                 # 【根本修复】无论上面怎么走，必须强制关闭 ws 和 session，加超时防卡
                 if ws is not None:
                     try:

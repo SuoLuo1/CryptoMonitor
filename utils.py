@@ -328,12 +328,15 @@ class TelegramNotifier:
         import sqlite3
         
         try:
-            # 解析币种 (例如：JCTUSDT, GWEIUSDT)
-            symbol_match = re.search(r'<b>([A-Z]+USDT)</b>', msg)
+            # 解析币种 (例如：JCTUSDT, GWEIUSDT, 1000FLOKIUSDT, 龙虾USDT)
+            # 🐾 修复: [A-Z]+USDT 匹配不到带数字/中文的币名 → symbol=None
+            symbol_match = re.search(r'<b>([^<>]+USDT)</b>', msg)
             symbol = symbol_match.group(1) if symbol_match else None
             
             if not symbol:
-                return
+                # 🐾 修复: 裸 return 只返回单个 None, 调用方解包 3 个变量直接
+                # TypeError 炸穿 WS callback → 整条连接被杀 → 无限重连
+                return None, None, None
             
             # 解析信号类型
             signal_type = "未知"
