@@ -57,3 +57,4 @@ config.yml
 *.token
 credentials.json
 secrets.json
+backtest_results/
