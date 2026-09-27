@@ -292,7 +292,8 @@ def run_backtest(date_str=None):
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, f'backtest_{date_str}.csv')
     if results:
-        with open(csv_path, 'w', newline='') as fh:
+        # 🐾 utf-8-sig 带BOM: Windows Excel 打开无BOM的UTF-8 CSV会按GBK解码 → emoji/中文乱码
+        with open(csv_path, 'w', newline='', encoding='utf-8-sig') as fh:
             w = _csv.writer(fh)
             w.writerow(['signal_time', 'symbol', 'signal_type', 'entry', 'stop_loss',
                         'take_profit', 'exit_price', 'exit_time', 'exit_reason',
