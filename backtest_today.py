@@ -286,6 +286,25 @@ def run_backtest(date_str=None):
     print(f"📊 {date_str} 回测结果 (首次看涨信号做多, 动态1:{RR_RATIO})")
     print("=" * 78)
 
+    # 🐾 逐笔明细落盘 CSV (backtest_results/backtest_YYYY-MM-DD.csv)
+    import csv as _csv
+    out_dir = '/root/CryptoMonitor/backtest_results'
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f'backtest_{date_str}.csv')
+    if results:
+        with open(csv_path, 'w', newline='') as fh:
+            w = _csv.writer(fh)
+            w.writerow(['signal_time', 'symbol', 'signal_type', 'entry', 'stop_loss',
+                        'take_profit', 'exit_price', 'exit_time', 'exit_reason',
+                        'risk_pct', 'pnl_pct', 'net_pnl_u', 'roi_pct'])
+            for r in results:
+                w.writerow([r['time'], r['symbol'], r['signal_type'],
+                            f"{r['entry']:.8f}", f"{r['stop_loss']:.8f}", f"{r['take_profit']:.8f}",
+                            f"{r['actual_exit']:.8f}", r['exit_time'], r['exit_reason'],
+                            f"{r['risk_pct']:.2f}", f"{r['pnl_pct']:.2f}",
+                            f"{r['net_pnl']:.2f}", f"{r['roi_pct']:.2f}"])
+        print(f"📁 逐笔明细已存: {csv_path} ({len(results)} 笔)")
+
     if not results:
         print("无结果")
     else:
