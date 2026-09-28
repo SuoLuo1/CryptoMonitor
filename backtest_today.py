@@ -27,8 +27,15 @@ v8 相对旧文件版的修复 (全部实测验证过):
 
 只读模式: 只读 alerts.db, 不动 main.py, 不发 Telegram
 用法:
-    python3 backtest_today.py             # 回测今天
-    python3 backtest_today.py 2026-09-23  # 回测指定日期
+    python3 backtest_today.py                        # 回测今天 (1:3 止盈)
+    python3 backtest_today.py 2026-09-23             # 回测指定日期 (1:3)
+    python3 backtest_today.py 2026-09-23 trailing 3  # 移动止盈模式, 回撤3%平仓
+
+出场模式:
+    rr       (默认) 固定止盈 = entry + risk × 3 (动态1:3)
+    trailing 移动止盈: 出场线 = max(初始止损, 盘中最高价 × (1 - 回撤%))
+             逐根K线推进, 保守口径: 先用"截至上一根的peak"判定本根是否击穿,
+             再更新 peak (不用本根 high 抬高后再回踩判死, 避免K线内部顺序假设)
 
 作者: 灵爪 (御姐猫娘风)
 """
@@ -67,7 +74,17 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 # === 全天K线缓存 (一次拉齐全天, 修复截断+缓存污染) ===
+# 🐾 内存上限: episode跨天回测会拉数百币×多天, 无上限会OOM被杀 (9-27实测)
+_MAX_CACHE_ENTRIES = 300
 _day_cache = {}  # (symbol, interval, date_str) -> klines list
+
+
+def _put_cache(key, data):
+    """带上限的缓存写入: 超限时清一半 (FIFO), 防OOM"""
+    if len(_day_cache) >= _MAX_CACHE_ENTRIES:
+        for k in list(_day_cache.keys())[:_MAX_CACHE_ENTRIES // 2]:
+            del _day_cache[k]
+    _day_cache[key] = data
 
 
 def get_day_klines(symbol, interval, date_str):
@@ -87,7 +104,7 @@ def get_day_klines(symbol, interval, date_str):
     if is_past_day and os.path.exists(cache_path):
         with open(cache_path, 'r') as f:
             data = json.load(f)
-            _day_cache[key] = data
+            _put_cache(key, data)
             return data
 
     day_start = datetime.strptime(f'{date_str} 00:00:00', '%Y-%m-%d %H:%M:%S').replace(tzinfo=BJ_TZ)
@@ -125,7 +142,7 @@ def get_day_klines(symbol, interval, date_str):
             json.dump(data, f)
     time.sleep(0.05)  # 友好限流
 
-    _day_cache[key] = data
+    _put_cache(key, data)
     return data
 
 
@@ -168,7 +185,7 @@ def window_min_low(symbol, signal_ts_ms, n, date_str):
 
 
 # === 主回测 ===
-def run_backtest(date_str=None):
+def run_backtest(date_str=None, mode='rr', trail_pct=3.0):
     if date_str is None:
         date_str = datetime.now(BJ_TZ).strftime('%Y-%m-%d')
 
@@ -176,7 +193,10 @@ def run_backtest(date_str=None):
     day_end = datetime.strptime(f'{date_str} 23:59:59', '%Y-%m-%d %H:%M:%S').replace(tzinfo=BJ_TZ)
 
     print(f"==> 回测日期: {date_str} (北京时间 00:00:00 ~ 23:59:59)")
-    print(f"==> 策略: 首次看涨信号做多 | 止损=前收盘K线low×{1-STOP_LOSS_PCT:.2f} | 止盈=动态1:{RR_RATIO}")
+    if mode == 'trailing':
+        print(f"==> 策略: 首次看涨信号做多 | 初始止损=前收盘K线low×{1-STOP_LOSS_PCT:.2f} | 移动止盈=盘中最高回撤{trail_pct:g}%")
+    else:
+        print(f"==> 策略: 首次看涨信号做多 | 止损=前收盘K线low×{1-STOP_LOSS_PCT:.2f} | 止盈=动态1:{RR_RATIO}")
     print(f"==> 仓位: {PRINCIPAL_USDT}U × {LEVERAGE}x = 名义 {NOTIONAL}U | 手续费 {MAKER_FEE_PCT*100:.2f}% (开+平)")
     print(f"==> 缓存: {CACHE_DIR}")
     print("=" * 78)
@@ -254,14 +274,33 @@ def run_backtest(date_str=None):
         actual_exit = None
         exit_reason = 'period_end'
         exit_ts = period[-1][0]
-        for k in period:
-            k_low, k_high = float(k[3]), float(k[2])
-            if k_low <= stop_loss:
-                actual_exit, exit_reason, exit_ts = stop_loss, 'stop_loss', k[0]
-                break
-            if k_high >= take_profit:
-                actual_exit, exit_reason, exit_ts = take_profit, 'take_profit', k[0]
-                break
+        if mode == 'trailing':
+            # 🐾 移动止盈: 出场线 = max(初始止损, 盘中peak × (1-trail_pct%))
+            # 保守口径: 先用"截至上一根"的peak判定本根low是否击穿出场线, 再更新peak
+            # (避免同一根K线内 high→low 顺序假设造成的高估)
+            peak = entry
+            exit_line_final = stop_loss
+            for k in period:
+                k_low, k_high = float(k[3]), float(k[2])
+                exit_line = max(stop_loss, peak * (1 - trail_pct / 100))
+                exit_line_final = exit_line
+                if k_low <= exit_line:
+                    actual_exit = exit_line
+                    exit_reason = 'trailing_stop' if exit_line > stop_loss else 'stop_loss'
+                    exit_ts = k[0]
+                    break
+                peak = max(peak, k_high)
+            # CSV/表格的"止盈列"显示实际移动止盈线 (trailing模式无固定TP)
+            take_profit = exit_line_final
+        else:
+            for k in period:
+                k_low, k_high = float(k[3]), float(k[2])
+                if k_low <= stop_loss:
+                    actual_exit, exit_reason, exit_ts = stop_loss, 'stop_loss', k[0]
+                    break
+                if k_high >= take_profit:
+                    actual_exit, exit_reason, exit_ts = take_profit, 'take_profit', k[0]
+                    break
         if actual_exit is None:
             actual_exit = float(period[-1][4])  # 收盘强平
 
@@ -283,14 +322,20 @@ def run_backtest(date_str=None):
     # === 输出 ===
     print()
     print("=" * 78)
-    print(f"📊 {date_str} 回测结果 (首次看涨信号做多, 动态1:{RR_RATIO})")
+    if mode == 'trailing':
+        print(f"📊 {date_str} 回测结果 (首次看涨信号做多, 移动止盈回撤{trail_pct:g}%)")
+        mode_tag = f'trailing{trail_pct:g}'
+    else:
+        print(f"📊 {date_str} 回测结果 (首次看涨信号做多, 动态1:{RR_RATIO})")
+        mode_tag = 'rr1x3'
     print("=" * 78)
 
-    # 🐾 逐笔明细落盘 CSV (backtest_results/backtest_YYYY-MM-DD.csv)
+    # 🐾 逐笔明细落盘 CSV (backtest_results/backtest_YYYY-MM-DD[_模式].csv)
     import csv as _csv
     out_dir = '/root/CryptoMonitor/backtest_results'
     os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, f'backtest_{date_str}.csv')
+    suffix = '' if mode == 'rr' else f'_{mode_tag}'
+    csv_path = os.path.join(out_dir, f'backtest_{date_str}{suffix}.csv')
     if results:
         # 🐾 utf-8-sig 带BOM: Windows Excel 打开无BOM的UTF-8 CSV会按GBK解码 → emoji/中文乱码
         with open(csv_path, 'w', newline='', encoding='utf-8-sig') as fh:
@@ -309,26 +354,31 @@ def run_backtest(date_str=None):
     if not results:
         print("无结果")
     else:
-        print(f"\n{'信号时刻':<9} {'币种':<14} {'信号':<7} {'入场':>10} {'止损':>10} {'止盈':>10} "
-              f"{'出场':>10} {'出场时':>6} {'盈亏%':>8} {'净利U':>8} {'理由':<11}")
-        print("-" * 122)
+        tp_col = '移动止盈线' if mode == 'trailing' else '止盈'
+        print(f"\n{'信号时刻':<9} {'币种':<14} {'信号':<7} {'入场':>10} {'止损':>10} {tp_col:>10} "
+              f"{'出场':>10} {'出场时':>6} {'盈亏%':>8} {'净利U':>8} {'理由':<13}")
+        print("-" * 124)
         for r in results:
             print(f"{r['time'][11:]:<9} {r['symbol']:<14} {r['signal_type']:<7} "
                   f"${r['entry']:>9.6f} ${r['stop_loss']:>9.6f} ${r['take_profit']:>9.6f} "
                   f"${r['actual_exit']:>9.6f} {r['exit_time']:>6} "
-                  f"{r['pnl_pct']:>+7.2f}% {r['net_pnl']:>+7.2f} {r['exit_reason']:<11}")
+                  f"{r['pnl_pct']:>+7.2f}% {r['net_pnl']:>+7.2f} {r['exit_reason']:<13}")
 
         total_net = sum(r['net_pnl'] for r in results)
         win = sum(1 for r in results if r['net_pnl'] > 0)
         stop_out = sum(1 for r in results if r['exit_reason'] == 'stop_loss')
-        tp_hit = sum(1 for r in results if r['exit_reason'] == 'take_profit')
         period_end = sum(1 for r in results if r['exit_reason'] == 'period_end')
         avg_risk = sum(r['risk_pct'] for r in results) / len(results)
 
-        print("-" * 122)
+        print("-" * 124)
         print(f"\n🎯 总计: {len(results)} 笔 | 盈: {win} | 亏: {len(results) - win} | 胜率: {win / len(results) * 100:.1f}%")
         print(f"💰 净收益: {total_net:+.2f}U (每笔本金 {PRINCIPAL_USDT}U × {LEVERAGE}x)")
-        print(f"📈 止盈 {tp_hit} 笔 | 止损 {stop_out} 笔 | 收盘强平 {period_end} 笔 | 平均风险距离 {avg_risk:.2f}%")
+        if mode == 'trailing':
+            trail_out = sum(1 for r in results if r['exit_reason'] == 'trailing_stop')
+            print(f"📈 移动止盈 {trail_out} 笔 | 止损 {stop_out} 笔 | 收盘强平 {period_end} 笔 | 平均风险距离 {avg_risk:.2f}%")
+        else:
+            tp_hit = sum(1 for r in results if r['exit_reason'] == 'take_profit')
+            print(f"📈 止盈 {tp_hit} 笔 | 止损 {stop_out} 笔 | 收盘强平 {period_end} 笔 | 平均风险距离 {avg_risk:.2f}%")
 
         print(f"\n📊 按信号类型:")
         by_type = defaultdict(lambda: {'count': 0, 'pnl': 0.0, 'win': 0})
@@ -349,4 +399,18 @@ def run_backtest(date_str=None):
 
 
 if __name__ == '__main__':
-    run_backtest(sys.argv[1] if len(sys.argv) > 1 else None)
+    args = sys.argv[1:]
+    _date = None
+    _mode = 'rr'
+    _trail = 3.0
+    for i, a in enumerate(args):
+        if a == 'trailing':
+            _mode = 'trailing'
+            if i + 1 < len(args):
+                try:
+                    _trail = float(args[i + 1])
+                except ValueError:
+                    pass
+        elif a.startswith('20'):
+            _date = a
+    run_backtest(_date, mode=_mode, trail_pct=_trail)
