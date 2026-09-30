@@ -49,6 +49,7 @@ Thumbs.db
 *.old
 
 # ==================== 配置文件（含 API Key） ====================
+.security/
 config.yaml
 config.yml
 .env
