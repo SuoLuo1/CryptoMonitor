@@ -224,6 +224,9 @@ class TelegramNotifier:
         BJ_TZ = timezone(timedelta(hours=8))
         now_str = datetime.now(BJ_TZ).strftime('%H:%M')
 
+        # 🐾 跨天日期显示需要 datetime 类 (10-04)
+        _dt = datetime
+
         # 1. 查今日所有 symbol 排行
         top_list = self.get_today_symbols_top(limit=100)
 
@@ -251,8 +254,20 @@ class TelegramNotifier:
             else:
                 fire = ""
 
-            # ⏱ 首次信号时间 (HH:MM)
-            first_time = first_ts[11:16] if first_ts and len(first_ts) >= 16 else "--:--"
+            # ⏱ 首次信号时间 (HH:MM), 跨天则带日期 (M/D HH:MM)
+            # 🐾 10-04: 12h 滑动窗口后, 首次时间可能是昨天/前天, 加日期主人能看清"老面孔"
+            if first_ts and len(first_ts) >= 16:
+                try:
+                    first_dt = _dt.fromisoformat(first_ts)
+                    now_bj = _dt.now()
+                    if first_dt.date() == now_bj.date():
+                        first_time = first_dt.strftime('%H:%M')
+                    else:
+                        first_time = first_dt.strftime('%m/%d %H:%M')
+                except Exception:
+                    first_time = first_ts[11:16]
+            else:
+                first_time = "--:--"
 
             # 主方向 + 涨跌幅：仅当 ≥2 次才有意义（1次时首次就是自己，没比较）
             if cnt >= 2 and latest_p is not None and first_p and first_p > 0:
@@ -301,63 +316,97 @@ class TelegramNotifier:
 
         return header + "\n".join(lines) + separator + current_msg
 
+    # 🐾 12h 滑动窗口阈值: 该币沉寂超过此时长视为新冒头, 重置"首次"
+    SILENT_HOURS = 12.0
+    # 🐾 僵尸币过滤: 超过此时长无任何 urgent 信号 → 不进 Top (否则几周前的僵尸会污染排名)
+    ACTIVE_HOURS = 24.0
+
     def get_today_symbols_top(self, limit=100):
         """
-        【新版】查询今日所有 (symbol) 聚合排行
+        查询所有 (symbol) 聚合排行 —— 【12h 滑动窗口版】
 
         返回: [(symbol, total_count, first_price, latest_price, first_ts), ...]
         按 total_count DESC, last_alert DESC 排序
 
-        🐾 修复两个价格 bug (实测案例):
-        1. first_price 原用 MIN(price_at_alert) 取到的是"最低价"不是"首次价"
-           → TAKEUSDT 实际 0.11094 跌到 0.06525 (-41%), 却因 MIN==latest 显示"➖持平"
-        2. latest_price 原取"时间戳最大那行", 但该行 price_at_alert 可能为 NULL
-           (🚀暴涨 消息格式无"现价："字段) → JOEUSDT 涨 9% 却整行空白
-        → 现在两个价格都按时间序取"最近的非 NULL 价格"
+        🐾 12h 滑动窗口语义 (主人 10-04 拍板):
+          - 每币每信号独立窗口
+          - 沉寂 < 12h → 跟上一波接着算 (首次 = 当前窗口内最早一条)
+          - 沉寂 ≥ 12h → 视为新冒头, 重置 (首次 = 本次这一条)
+          - 涨幅 = 窗口首次价 → 最新价 (跟 UI 上显示的⏱首次时间是同一个基准)
+
+        🐾 历史价格 bug 修复沿用:
+          1. first_price 取"窗口首次时间点"的价 (不是 MIN 价, 不是 DB 最早价)
+          2. latest_price 取"时间最新且 price_at_alert 非 NULL"的价
         """
         import sqlite3
         from datetime import datetime, timezone, timedelta
-        BJ_TZ = timezone(timedelta(hours=8))
-        today_start = datetime.now(BJ_TZ).strftime('%Y-%m-%d 00:00:00')
 
         try:
             conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
             cursor = conn.cursor()
+
+            # 🐾 一次性拿到所有 urgent 记录的 (symbol, timestamp, price_at_alert)
+            #   在 Python 侧按 12h 窗口切分, 简单可靠 (避免 SQLite 复杂子查询难调)
             cursor.execute("""
-                WITH per_symbol AS (
-                    SELECT symbol,
-                           MIN(timestamp) as first_ts,
-                           MAX(timestamp) as last_ts
-                    FROM alerts
-                    WHERE priority = 'urgent' AND timestamp >= ?
-                    GROUP BY symbol
-                )
-                SELECT a.symbol,
-                       COUNT(*) as cnt,
-                       (SELECT price_at_alert FROM alerts f1
-                          WHERE f1.symbol = a.symbol
-                            AND f1.priority = 'urgent'
-                            AND f1.timestamp >= ?
-                            AND f1.price_at_alert IS NOT NULL
-                          ORDER BY f1.timestamp ASC LIMIT 1) as first_price,
-                       (SELECT price_at_alert FROM alerts f2
-                          WHERE f2.symbol = a.symbol
-                            AND f2.priority = 'urgent'
-                            AND f2.timestamp >= ?
-                            AND f2.price_at_alert IS NOT NULL
-                          ORDER BY f2.timestamp DESC LIMIT 1) as latest_price,
-                       p.first_ts as first_ts,
-                       p.last_ts as last_alert
-                FROM alerts a
-                JOIN per_symbol p ON a.symbol = p.symbol
-                WHERE a.priority = 'urgent' AND a.timestamp >= ?
-                GROUP BY a.symbol
-                ORDER BY cnt DESC, last_alert DESC
-                LIMIT ?
-            """, (today_start, today_start, today_start, today_start, limit))
-            rows = cursor.fetchall()
+                SELECT symbol, timestamp, price_at_alert
+                FROM alerts
+                WHERE priority = 'urgent'
+                  AND price_at_alert IS NOT NULL
+                ORDER BY symbol ASC, timestamp ASC
+            """)
+            raw_rows = cursor.fetchall()
             conn.close()
-            return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+            if not raw_rows:
+                return []
+
+            from collections import defaultdict
+            from datetime import datetime as _dt
+
+            # 1. 按 symbol 分组, 每组按时间升序
+            per_sym = defaultdict(list)
+            for sym, ts, price in raw_rows:
+                per_sym[sym].append((ts, price))
+
+            # 2. 对每只币: 找到"当前 12h 窗口"的首次
+            #    算法: 从该币最后一条往前回溯, 遇到第一个间隔 >12h 的就停,
+            #          那个间隔之后的"连续段"就是当前窗口
+            #    兜底: 如果最后一条本身就沉寂超 ACTIVE_HOURS, 整只币视作僵尸, 跳过
+            SILENT = self.SILENT_HOURS * 3600.0
+            ACTIVE = self.ACTIVE_HOURS * 3600.0
+            now_epoch = _dt.now().timestamp()
+            results = []
+            for sym, recs in per_sym.items():
+                if not recs:
+                    continue
+                last_ts, last_price = recs[-1]
+                last_epoch = _dt.fromisoformat(last_ts).timestamp()
+
+                # 🐾 僵尸币过滤: 最后一次 urgent 距今 > ACTIVE_HOURS → 跳过
+                if now_epoch - last_epoch > ACTIVE:
+                    continue
+
+                # 找到当前窗口的起始索引
+                win_start_idx = len(recs) - 1
+                for i in range(len(recs) - 2, -1, -1):
+                    ts_i = _dt.fromisoformat(recs[i][0]).timestamp()
+                    if last_epoch - ts_i > SILENT:
+                        break  # 间隔超过 12h, 这条之前的不算当前窗口
+                    win_start_idx = i
+
+                win_start_ts, win_start_price = recs[win_start_idx]
+                cnt = len(recs) - win_start_idx  # 当前窗口内的累计次数
+
+                # latest_price 沿用"该窗口内时间最新的价" (窗口内每条都有 price, 所以就是最后一条)
+                latest_price = last_price
+
+                results.append((sym, cnt, win_start_price, latest_price, win_start_ts, last_ts))
+
+            # 3. 排序: cnt DESC, last_alert DESC, 截 limit
+            results.sort(key=lambda x: (-x[1], -_dt.fromisoformat(x[5]).timestamp()))
+
+            return [(r[0], r[1], r[2], r[3], r[4]) for r in results[:limit]]
+
         except Exception as e:
             logger.error(f"❌ [get_today_symbols_top] 查询失败：{e}", exc_info=True)
             return []
