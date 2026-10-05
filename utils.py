@@ -363,10 +363,10 @@ class TelegramNotifier:
             from collections import defaultdict
             from datetime import datetime as _dt
 
-            # 1. 按 symbol 分组, 每组按时间升序
+            # 1. 按 symbol 分组, 每组按时间升序 (timestamp 转 datetime, 方便算间隔)
             per_sym = defaultdict(list)
             for sym, ts, price in raw_rows:
-                per_sym[sym].append((ts, price))
+                per_sym[sym].append((_dt.fromisoformat(ts), price))
 
             # 2. 对每只币: 找到"当前 12h 窗口"的首次
             #    算法: 从该币最后一条往前回溯, 遇到第一个间隔 >12h 的就停,
@@ -380,19 +380,21 @@ class TelegramNotifier:
                 if not recs:
                     continue
                 last_ts, last_price = recs[-1]
-                last_epoch = _dt.fromisoformat(last_ts).timestamp()
 
                 # 🐾 僵尸币过滤: 最后一次 urgent 距今 > ACTIVE_HOURS → 跳过
+                last_epoch = last_ts.timestamp() if isinstance(last_ts, _dt) else _dt.fromisoformat(last_ts).timestamp()
                 if now_epoch - last_epoch > ACTIVE:
                     continue
 
-                # 找到当前窗口的起始索引
+                # 🐾 主人语义 (10-05): 从末条往前扫描, 找到【第一个】相邻间隔 >12h 的位置
+                #    那个间隔之后的"起点"就是当前窗口的首次 (前面的整段抛弃)
+                #    不需要继续往前追溯, 因为"超过 12h 就清空"只看相邻间隔
                 win_start_idx = len(recs) - 1
                 for i in range(len(recs) - 2, -1, -1):
-                    ts_i = _dt.fromisoformat(recs[i][0]).timestamp()
-                    if last_epoch - ts_i > SILENT:
-                        break  # 间隔超过 12h, 这条之前的不算当前窗口
-                    win_start_idx = i
+                    diff = (recs[i + 1][0] - recs[i][0]).total_seconds()
+                    if diff > SILENT:
+                        win_start_idx = i + 1  # 这条(后者)是新的窗口起点
+                        break  # 找到第一个 >12h 边界就停
 
                 win_start_ts, win_start_price = recs[win_start_idx]
                 cnt = len(recs) - win_start_idx  # 当前窗口内的累计次数
@@ -403,7 +405,7 @@ class TelegramNotifier:
                 results.append((sym, cnt, win_start_price, latest_price, win_start_ts, last_ts))
 
             # 3. 排序: cnt DESC, last_alert DESC, 截 limit
-            results.sort(key=lambda x: (-x[1], -_dt.fromisoformat(x[5]).timestamp()))
+            results.sort(key=lambda x: (-x[1], -x[5].timestamp()))
 
             return [(r[0], r[1], r[2], r[3], r[4]) for r in results[:limit]]
 
