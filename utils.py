@@ -407,7 +407,13 @@ class TelegramNotifier:
             # 3. 排序: cnt DESC, last_alert DESC, 截 limit
             results.sort(key=lambda x: (-x[1], -x[5].timestamp()))
 
-            return [(r[0], r[1], r[2], r[3], r[4]) for r in results[:limit]]
+            # 🐾 出口转字符串: 内部用 datetime 是为了算间隔方便, 渲染层继续用 ISO 字符串 (向后兼容)
+            out = []
+            for r in results[:limit]:
+                sym, cnt, fp, lp, ws_ts, last_ts = r
+                ws_str = ws_ts.strftime('%Y-%m-%d %H:%M:%S') if isinstance(ws_ts, _dt) else ws_ts
+                out.append((sym, cnt, fp, lp, ws_str))
+            return out
 
         except Exception as e:
             logger.error(f"❌ [get_today_symbols_top] 查询失败：{e}", exc_info=True)
