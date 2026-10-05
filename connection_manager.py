@@ -233,7 +233,9 @@ class MultiConnectionManager:
                             # 🐾 防御: 单条消息的 callback 异常不再杀整条 WS 连接
                             # (根因案例: _save_alert_to_db 裸return导致解包TypeError,
                             #  炸穿 process_kline → async for → 断线 → 无限重连)
-                            logger.warning(f"⚠️ [{name}] callback 异常已隔离: {type(cb_err).__name__}: {cb_err}")
+                            import traceback
+                            tb = traceback.format_exc()
+                            logger.warning(f"⚠️ [{name}] callback 异常已隔离: {type(cb_err).__name__}: {cb_err}\n{tb}")
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         exit_reason = "break_error"
                         exc_info_str = f"ws.exception={ws.exception()}"
