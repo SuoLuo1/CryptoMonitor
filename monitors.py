@@ -401,7 +401,7 @@ class Monitors:
                     k_emoji = "🔴" if last_kline_pct < 0 else "🟢"
                     kline_str = f"\n对应币价: {k_emoji} {last_kline_pct * 100:+.2f}% (1m)"
 
-                msg = (f"📊 <b>持仓异动 (1m): {symbol}</b>\n"
+                msg = (f"📊 持仓异动 (1m): <b>{symbol}</b>\n"
                     f"方向: {direction} {delta_pct * 100:.2f}%\n"
                     f"变动: ${delta_val:,.0f}\n"
                     f"总量: ${oi_val:,.0f}\n"
