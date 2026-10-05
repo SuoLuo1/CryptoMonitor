@@ -356,7 +356,8 @@ class MultiConnectionManager:
                     logger.info(f"OI 轮询: {valid}/{len(current_symbols)} OK")
 
                 except Exception as e:
-                    logger.error(f"OI Loop Err: {e}")
+                    import traceback
+                    logger.error(f"OI Loop Err: {e}\n{traceback.format_exc()}")
 
                 elapsed = time.time() - start_time
                 await asyncio.sleep(max(10, 60 - elapsed))
