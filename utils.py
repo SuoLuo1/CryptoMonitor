@@ -460,22 +460,24 @@ class TelegramNotifier:
                 signal_type = "🐋巨鲸"
             
             # 解析价格 (如果有) - 支持多种格式
+            # 🐾 10-06: 加 eE+- 支持科学计数法 (否则 SPELL/NEIRO 这类 < 0.001 的币
+            #   f-string 会输出 9.85e-05, 原正则只匹配 9.85, 错位 100000 倍)
             price = None
-            
-            # 格式 1: "现价：3.283" (中文冒号)
-            price_match = re.search(r'现价：\s*([0-9.]+)', msg)
+
+            # 格式 1: "现价：3.283" 或 "现价：9.85e-05" (中文冒号)
+            price_match = re.search(r'现价：\s*([0-9.eE+-]+)', msg)
             if price_match:
                 price = float(price_match.group(1))
-            
-            # 格式 2: "现价：3.283" (英文冒号)
+
+            # 格式 2: "现价:3.283" 或 "现价:9.85e-05" (英文冒号)
             if not price:
-                price_match = re.search(r'现价:\s*([0-9.]+)', msg)
+                price_match = re.search(r'现价:\s*([0-9.eE+-]+)', msg)
                 if price_match:
                     price = float(price_match.group(1))
-            
-            # 格式 3: "$3.283"
+
+            # 格式 3: "$3.283" 或 "$9.85e-05"
             if not price:
-                price_match = re.search(r'\$([0-9.]+)', msg)
+                price_match = re.search(r'\$([0-9.eE+-]+)', msg)
                 if price_match:
                     price = float(price_match.group(1))
             

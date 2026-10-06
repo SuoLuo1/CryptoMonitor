@@ -8,6 +8,17 @@ from utils import notifier
 
 
 class Monitors:
+    # 🐾 10-06: 价格格式化辅助函数, 避免科学计数法 (主人反馈 SPELL/NEIRO 显示 '9.85e-05')
+    @staticmethod
+    def _fmt_price(p):
+        """价格格式化: 不使用科学计数法, 保留合适精度"""
+        if p == 0:
+            return "0"
+        if abs(p) >= 1:
+            s = f"{p:.2f}"
+            return s.rstrip('0').rstrip('.') if '.' in s else s
+        return f"{p:.8f}"
+
     # --- 核心修复：添加一个内存字典，记录上一次报警时间 ---
     # 格式: { "BTCUSDT_WALL": 1700000000, "ETHUSDT_PUMP": 1700000000 }
     alert_history = {}
@@ -242,7 +253,7 @@ class Monitors:
                     await notifier.send_urgent(
                         f"{direction} <b>{symbol}</b> (1H趋势)\n"
                         f"累计幅度: {trend_pct * 100:+.2f}% (近{len(cls.rolling_window[symbol])}分钟)\n"
-                        f"现价: {close_p}"
+                        f"现价: {cls._fmt_price(close_p)}"
                         f"{oi_str}\n"
                         f"信号: 价格与持仓趋势共振"
                     )
@@ -271,7 +282,7 @@ class Monitors:
                         oi_str += f"\n持仓变化: {oi_emoji} {delta * 100:+.2f}%"
                 msg = (f"{emoji} <b>{symbol}</b> (1m)\n"
                        f"幅度: {change_pct * 100:.2f}%\n"
-                       f"现价: {close_p}"
+                       f"现价: {cls._fmt_price(close_p)}"
                        f"{oi_str}")
 
                 # 【双发模式】
@@ -336,7 +347,7 @@ class Monitors:
                    f"幅度: {change_pct * 100:.2f}%\n"
                    f"放量: {vol_ratio:.1f}x (vs 前5根均量)\n"
                    f"成交额: ${kline_vol:,.0f}\n"
-                   f"现价: {close_p}"
+                   f"现价: {cls._fmt_price(close_p)}"
                    f"{oi_str}")
 
             # 【双发模式】与1m信号一致
@@ -405,7 +416,7 @@ class Monitors:
                     f"方向: {direction} {delta_pct * 100:.2f}%\n"
                     f"变动: ${delta_val:,.0f}\n"
                     f"总量: ${oi_val:,.0f}\n"
-                    f"现价: {price}"
+                    f"现价: {cls._fmt_price(price)}"
                     f"{kline_str}"
                 )
                 await notifier.send_urgent(msg)
@@ -452,7 +463,7 @@ class Monitors:
                 msg = (f"🐋 <b>{emoji} {symbol}</b>\n"
                        f"5秒累计成交: ${side_sum:,.0f}\n"
                        f"方向: {side}\n"
-                       f"现价: {price}")
+                       f"现价: {cls._fmt_price(price)}")
                 if side_sum > 30000000:
                     await notifier.send_buffered(msg)
             return
