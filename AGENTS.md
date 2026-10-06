@@ -41,3 +41,13 @@ The cloud server remains the source of truth for behavior that depends on
 network access, credentials, or runtime services. Local checks are limited to
 static validation of the synchronization tooling unless the task explicitly
 requires otherwise.
+
+## Git commits
+
+- Use the repository's existing conventional style: `feat:`, `fix:`,
+  `chore:`, `docs:`, or another accurate type followed by a concise Chinese
+  subject that states what changed and why.
+- When a change has meaningful implementation or validation details, add a
+  commit body describing the affected behavior, important safeguards, and the
+  cloud-side checks that passed. Do not put credentials, server connection
+  details, raw runtime data, or company information in a commit message.
