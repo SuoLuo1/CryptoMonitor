@@ -111,6 +111,94 @@ class Monitors:
             return data['amount'], data['time'], data['delta']
         return 0, 0, 0
     # ---------------------------------------------------------
+    @classmethod
+    async def _record_event_signal(
+        cls, signal_kind, symbol, direction, evidence, msg, signal_type,
+        price, *, chart=False, buffered=False
+    ):
+        """所有事件信号先入库，再独立裁决是否推送，确保被抑制信号仍进入历史统计。"""
+        await notifier.save_to_db_now(
+            symbol, signal_type, msg, price, priority="urgent"
+        )
+        allow, reason = SignalDeduplicator.arbitrate(
+            signal_kind, symbol, direction, evidence
+        )
+        if not allow:
+            print(f"[DEDUP] {symbol} {signal_kind} 抑制推送：{reason}")
+            return False, reason
+
+        push_msg = msg
+        if reason == "oi_3m_confirm":
+            push_msg = "✅ <b>联合确认：价格异动 + OI + 3m放量</b>\n" + msg
+        elif reason == "oi_strong":
+            push_msg = "🚨 <b>OI 强升级</b>\n" + msg
+
+        await notifier.send_urgent(
+            push_msg,
+            symbol=symbol,
+            signal_type=signal_type,
+            price=price,
+            save_to_db=False,
+        )
+        # 图表只随首条价格信号发送，确认/升级不重复生成图表。
+        if chart and reason in ("initial_1m", "initial_3m"):
+            asyncio.create_task(
+                notifier.send_chart(
+                    symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态"
+                )
+            )
+        if buffered and symbol in cls.vip_symbols:
+            await notifier.send_buffered(msg)
+        return True, reason
+
+    @classmethod
+    async def _check_reverse_shock(
+        cls, symbol, open_price, current_price, change_pct,
+        current_quote_volume, previous_volume_mean
+    ):
+        """检查事件高/低点的强反向冲击；冲击提醒不在本阶段切换事件方向。"""
+        event = SignalDeduplicator.get_event(symbol)
+        if event is None or event.notif_reverse_shock:
+            return False
+        if previous_volume_mean <= 0:
+            return False
+        if current_quote_volume < previous_volume_mean * REVERSE_SHOCK_VOL_RATIO:
+            return False
+
+        reverse_pct = 0.0
+        if event.direction > 0 and change_pct < 0 and event.event_high > 0:
+            reverse_pct = (event.event_high - current_price) / event.event_high
+            reverse_direction = -1
+        elif event.direction < 0 and change_pct > 0 and event.event_low > 0:
+            reverse_pct = (current_price - event.event_low) / event.event_low
+            reverse_direction = 1
+        else:
+            return False
+
+        if reverse_pct < REVERSE_SHOCK_PCT:
+            return False
+
+        evidence = {
+            "timestamp": time.time(),
+            "price": current_price,
+            "change_pct": change_pct,
+            "reverse_pct": reverse_pct,
+            "vol_ratio": current_quote_volume / previous_volume_mean,
+        }
+        msg = (
+            f"🚨 <b>强反向冲击: {symbol}</b>\n"
+            f"原事件方向: {'上涨' if event.direction > 0 else '下跌'}\n"
+            f"当前反向幅度: {reverse_pct * 100:.2f}%\n"
+            f"1m 成交额量比: {evidence['vol_ratio']:.1f}x\n"
+            f"现价: {cls._fmt_price(current_price)}\n"
+            f"说明: 已触发强反向冲击，暂不自动判定趋势反转"
+        )
+        allow, reason = await cls._record_event_signal(
+            "reverse_shock", symbol, reverse_direction, evidence, msg,
+            "🚨强反向冲击", current_price,
+        )
+        return allow and reason == "reverse_shock"
+
     # 1. 深度数据处理 (已修复刷屏)
     # ---------------------------------------------------------
     @classmethod
