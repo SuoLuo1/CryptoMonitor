@@ -180,14 +180,30 @@ class TelegramNotifier:
         if self.session:
             await self.session.close()
 
-    # --- 方法 A: 紧急发送 (直接进队列) ---
-    async def send_urgent(self, msg):
-        # ✅ 保存警报到数据库 (内部已走线程池, 不阻塞事件循环)
-        symbol, signal_type, price = await self._save_alert_to_db(msg, priority='urgent')
+    # --- 方法 A: 紧急消息发送 ---
+    async def save_to_db_now(
+        self, symbol, signal_type, msg, price=None, priority="urgent"
+    ):
+        """只保存原始信号，不发送 Telegram；供事件层抑制消息后保留历史记录。"""
+        return await self._save_alert_to_db(
+            msg, priority=priority, symbol=symbol, signal_type=signal_type, price=price
+        )
 
-        # 🔥 【新版】拼装 Top 排行 + 当前信号（全局视角，老板一眼看全市场热点）
-        if symbol and signal_type and price:
-            # 🐾 修复: Top排行要查sqlite, 挪到线程池执行
+    async def send_urgent(
+        self, msg, *, symbol=None, signal_type=None, price=None, save_to_db=True
+    ):
+        """紧急推送。默认兼容旧调用（先入库再发送）；新事件流显式传 save_to_db=False。"""
+        if save_to_db:
+            symbol, signal_type, price = await self._save_alert_to_db(
+                msg,
+                priority="urgent",
+                symbol=symbol,
+                signal_type=signal_type,
+                price=price,
+            )
+
+        # Top 排名仍从 alerts.db 读取，因此调用方必须在发消息前先完成入库。
+        if symbol and signal_type and price is not None:
             loop = asyncio.get_event_loop()
             final_msg = await loop.run_in_executor(
                 None, self._build_top_ranked_msg, symbol, signal_type, msg
@@ -421,89 +437,71 @@ class TelegramNotifier:
 
     # --- 方法 B: 缓冲发送 (进篮子) ---
 
-    async def _save_alert_to_db(self, msg, priority='buffered'):
-        """✅ 保存警报到 SQLite 数据库
-        
-        Args:
-            msg: 警报消息
-            priority: 'urgent' (紧急) 或 'buffered' (缓冲)
-        """
+    async def _save_alert_to_db(
+        self, msg, priority="buffered", *, symbol=None, signal_type=None, price=None
+    ):
+        """保存原始警报。允许调用方传入显式字段，避免通过消息文本猜测 OI 类型。"""
         import sqlite3
-        
+
         try:
-            # 解析币种 (例如：JCTUSDT, GWEIUSDT, 1000FLOKIUSDT, 龙虾USDT)
-            # 🐾 修复: [A-Z]+USDT 匹配不到带数字/中文的币名 → symbol=None
-            symbol_match = re.search(r'<b>([^<>]+USDT)</b>', msg)
-            symbol = symbol_match.group(1) if symbol_match else None
-            
             if not symbol:
-                # 🐾 修复: 裸 return 只返回单个 None, 调用方解包 3 个变量直接
-                # TypeError 炸穿 WS callback → 整条连接被杀 → 无限重连
+                symbol_match = re.search(r"<b>([^<>]+USDT)</b>", msg)
+                symbol = symbol_match.group(1) if symbol_match else None
+            if not symbol:
                 return None, None, None
-            
-            # 解析信号类型
-            signal_type = "未知"
-            is_3m = "(3m放量)" in msg
-            if "🚀 暴涨" in msg:
-                signal_type = "🚀暴涨3m" if is_3m else "🚀暴涨"
-            elif "📈 稳步爬升" in msg:
-                signal_type = "📈爬升"
-            elif "📉 持续阴跌" in msg:
-                signal_type = "📉阴跌"
-            elif "🩸 暴跌" in msg:
-                signal_type = "🩸暴跌3m" if is_3m else "🩸暴跌"
-            elif "阻力薄弱" in msg:
-                signal_type = "🧱阻力薄弱"
-            elif "支撑薄弱" in msg:
-                signal_type = "🧱支撑薄弱"
-            elif "巨鲸进场" in msg:
-                signal_type = "🐋巨鲸"
-            
-            # 解析价格 (如果有) - 支持多种格式
-            # 🐾 10-06: 加 eE+- 支持科学计数法 (否则 SPELL/NEIRO 这类 < 0.001 的币
-            #   f-string 会输出 9.85e-05, 原正则只匹配 9.85, 错位 100000 倍)
-            price = None
 
-            # 格式 1: "现价：3.283" 或 "现价：9.85e-05" (中文冒号)
-            price_match = re.search(r'现价：\s*([0-9.eE+-]+)', msg)
-            if price_match:
-                price = float(price_match.group(1))
+            # 保留旧消息解析逻辑；新事件路径优先使用显式 signal_type。
+            if signal_type is None:
+                signal_type = "未知"
+                is_3m = "(3m放量)" in msg
+                if "🚀 暴涨" in msg:
+                    signal_type = "🚀暴涨3m" if is_3m else "🚀暴涨"
+                elif "📈 稳步爬升" in msg:
+                    signal_type = "📈爬升"
+                elif "📉 持续阴跌" in msg:
+                    signal_type = "📉阴跌"
+                elif "🩸 暴跌" in msg:
+                    signal_type = "🩸暴跌3m" if is_3m else "🩸暴跌"
+                elif "阻力薄弱" in msg:
+                    signal_type = "🧱阻力薄弱"
+                elif "支撑薄弱" in msg:
+                    signal_type = "🧱支撑薄弱"
+                elif "巨鲸进场" in msg:
+                    signal_type = "🐋巨鲸"
 
-            # 格式 2: "现价:3.283" 或 "现价:9.85e-05" (英文冒号)
-            if not price:
-                price_match = re.search(r'现价:\s*([0-9.eE+-]+)', msg)
+            if price is None:
+                # 支持科学计数法和正负指数。
+                price_match = re.search(r"现价：?\s*([0-9.eE+-]+)", msg)
+                if not price_match:
+                    price_match = re.search(r"\$([0-9.eE+-]+)", msg)
                 if price_match:
-                    price = float(price_match.group(1))
+                    try:
+                        price = float(price_match.group(1))
+                    except ValueError:
+                        price = None
 
-            # 格式 3: "$3.283" 或 "$9.85e-05"
-            if not price:
-                price_match = re.search(r'\$([0-9.eE+-]+)', msg)
-                if price_match:
-                    price = float(price_match.group(1))
-            
-            # 写入数据库 (使用北京时间)
-            # 🐾 修复: sqlite 同步写挪到线程池, 不阻塞事件循环
             from datetime import datetime, timezone, timedelta
-            beijing_time = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+            beijing_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
             def _db_insert():
-                conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+                conn = sqlite3.connect("/root/CryptoMonitor/alerts.db")
                 try:
                     cursor = conn.cursor()
-                    cursor.execute("""
+                    cursor.execute(
+                        """
                         INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority, timestamp)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    """, (symbol, signal_type, msg, price, priority, beijing_time))
+                        """,
+                        (symbol, signal_type, msg, price, priority, beijing_time),
+                    )
                     conn.commit()
                 finally:
                     conn.close()
 
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, _db_insert)
-
             print(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
             return symbol, signal_type, price
-
         except Exception as e:
             print(f"[❌DB] 保存警报失败：{e}")
             return None, None, None
