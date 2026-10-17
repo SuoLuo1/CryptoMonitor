@@ -300,95 +300,133 @@ class Monitors:
     # ---------------------------------------------------------
     @classmethod
     async def process_kline(cls, data):
-        k = data.get('k')
-        if not k: return
-        interval = k.get('i')
-        if interval == '3m':
+        k = data.get("k")
+        if not k:
+            return
+        if k.get("i") == "3m":
             await cls._process_kline_3m(k)
             return
-        kline_vol = float(k['q'])
-        if kline_vol < 5000:
+
+        symbol = data.get("s") or k.get("s")
+        if not symbol:
             return
-        symbol = data.get('s')
-        close_p = float(k['c'])
-        is_closed = k['x']
-        cls.price_map[symbol] = close_p
-        if symbol not in cls.rolling_window:
-            cls.rolling_window[symbol] = deque(maxlen=cls.WINDOW_SIZE)
-        if is_closed:
-            cls.rolling_window[symbol].append(close_p)
-        if len(cls.rolling_window[symbol]) >= 10:
+        try:
+            quote_volume = float(k["q"])
+            open_price = float(k["o"])
+            price = float(k["c"])
+            closed = bool(k["x"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if open_price <= 0 or price <= 0:
+            return
 
-            start_p = cls.rolling_window[symbol][0]
-
-            trend_pct = (close_p - start_p) / start_p
-            if abs(trend_pct) > cls.TREND_THRESHOLD:
-                if cls._check_cooldown(f"{symbol}_TREND", 1800):  # 1H冷却
-
-                    direction = "📈 稳步爬升" if trend_pct > 0 else "📉 持续阴跌"
-
-                    oi_data = cls.oi_cache.get(symbol)
-                    oi_str = ""
-                    if oi_data:
-                        oi_trend = oi_data.get('delta_1h', 0)
-                        oi_val = oi_data['amount'] * close_p
-
-                        if abs(oi_trend) > 0.01:
-                            oi_emoji = "🔥 吸筹" if oi_trend > 0 else "💨 撤退"
-                            oi_str = (f"\n资金配合: {oi_emoji} {oi_trend * 100:+.2f}% (近1h)\n"
-                                      f"总持仓: ${oi_val:,.0f}")
-                        else:
-                            oi_str = f"\n资金配合: 😐 无明显变化 ({oi_trend * 100:+.2f}%)"
-
-                    await notifier.send_urgent(
-                        f"{direction} <b>{symbol}</b> (1H趋势)\n"
-                        f"累计幅度: {trend_pct * 100:+.2f}% (近{len(cls.rolling_window[symbol])}分钟)\n"
-                        f"现价: {cls._fmt_price(close_p)}"
-                        f"{oi_str}\n"
-                        f"信号: 价格与持仓趋势共振"
-                    )
-                    asyncio.create_task(
-                        notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
-                    )
-        open_p = float(k['o'])
-        change_pct = (close_p - open_p) / open_p
+        cls.price_map[symbol] = price
+        change_pct = (price - open_price) / open_price
         cls.kline_stats[symbol] = change_pct
 
-        if abs(change_pct) > PUMP_THRESHOLD:
-            direction = "PUMP" if change_pct > 0 else "DUMP"
+        # 仅使用之前已收盘的 1m K 线计算量能基准。
+        volume_window = cls.vol_window_1m.setdefault(symbol, deque(maxlen=5))
+        volume_mean = sum(volume_window) / len(volume_window) if len(volume_window) == 5 else 0.0
 
-            if cls._check_cooldown(f"{symbol}_{direction}", 60):
-                emoji = "🚀 暴涨" if change_pct > 0 else "🩸 暴跌"
+        # 更新事件价格极值，并在常规价格信号前检测强反向冲击。
+        SignalDeduplicator.observe_price(symbol, price)
+        shock_sent = False
+        if quote_volume >= 5000 and volume_mean > 0:
+            shock_sent = await cls._check_reverse_shock(
+                symbol, open_price, price, change_pct, quote_volume, volume_mean
+            )
 
-                oi_qty, oi_time, delta = cls._get_last_oi(symbol)
-                oi_str = ""
-                if oi_qty > 0:
-                    oi_val = oi_qty * close_p
-                    # 计算数据延迟了多久
-                    lag = int(time.time() - oi_time)
-                    oi_str = f"\n持仓总量: ${oi_val:,.0f} ({lag}s前)"
-                    if delta is not None:
-                        oi_emoji = "🔥 激增" if delta > 0.02 else ("📉 骤减" if delta < -0.02 else "➡️")
-                        oi_str += f"\n持仓变化: {oi_emoji} {delta * 100:+.2f}%"
-                msg = (f"{emoji} <b>{symbol}</b> (1m)\n"
-                       f"幅度: {change_pct * 100:.2f}%\n"
-                       f"现价: {cls._fmt_price(close_p)}"
-                       f"{oi_str}")
+        if symbol not in cls.rolling_window:
+            cls.rolling_window[symbol] = deque(maxlen=cls.WINDOW_SIZE)
+        if closed:
+            cls.rolling_window[symbol].append(price)
 
-                # 【双发模式】
-                # 1. 立即发给 TG (快)
-                await notifier.send_urgent(msg)
-                asyncio.create_task(
-                    notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
+        # 1m 强异动：所有达到原始冷却规则的信号都入库，TG 是否推送由事件层决定。
+        if quote_volume >= 5000 and abs(change_pct) > PUMP_THRESHOLD:
+            direction = 1 if change_pct > 0 else -1
+            direction_name = "UP" if direction > 0 else "DOWN"
+            if cls._check_cooldown(f"{symbol}_1M_RAW_{direction_name}", DB_DEDUP_COOLDOWN):
+                emoji = "🚀 暴涨" if direction > 0 else "🩸 暴跌"
+                oi_amount, oi_time, oi_delta = cls._get_last_oi(symbol)
+                oi_text = ""
+                if oi_amount > 0:
+                    oi_value = oi_amount * price
+                    lag = max(0, int(time.time() - oi_time))
+                    oi_text = f"\n持仓总量: $" + f"{oi_value:,.0f} ({lag}s前)"
+                    if oi_delta is not None:
+                        oi_emoji = "🔥 激增" if oi_delta > 0.02 else ("📉 骤减" if oi_delta < -0.02 else "➡️")
+                        oi_text += f"\n持仓变化: {oi_emoji} {oi_delta * 100:+.2f}%"
+                message = (
+                    f"{emoji} <b>{symbol}</b> (1m)\n"
+                    f"幅度: {change_pct * 100:.2f}%\n"
+                    f"现价: {cls._fmt_price(price)}{oi_text}"
                 )
-                # 2. 同时也发给 Buffer (给 AI 做上下文)
-                if symbol in cls.vip_symbols:
-                    await notifier.send_buffered(msg)
+                signal_type = "🚀暴涨" if direction > 0 else "🩸暴跌"
+                evidence = {
+                    "timestamp": time.time(), "price": price,
+                    "change_pct": change_pct, "quote_volume": quote_volume,
+                }
+                if shock_sent:
+                    # 强反向冲击已通知，本次方向信号只入库，避免一根 K 线双发。
+                    await notifier.save_to_db_now(
+                        symbol, signal_type, message, price, priority="urgent"
+                    )
+                else:
+                    await cls._record_event_signal(
+                        "initial_1m", symbol, direction, evidence, message,
+                        signal_type, price, chart=True, buffered=True,
+                    )
 
-    # ---------------------------------------------------------
-    # 2b. 3分钟K线放量异动 (与1m暴涨暴跌同通道)
-    #     条件: 3m涨跌 > 2% 且 本根成交额 > 前5根已收盘K线均量 * 3
-    # ---------------------------------------------------------
+        # 趋势信号若命中活动事件，只记为背景；否则保留独立趋势推送。
+        if quote_volume >= 5000 and len(cls.rolling_window[symbol]) >= 10:
+            start_price = cls.rolling_window[symbol][0]
+            if start_price > 0:
+                trend_pct = (price - start_price) / start_price
+                if abs(trend_pct) > cls.TREND_THRESHOLD and cls._check_cooldown(f"{symbol}_TREND", 1800):
+                    trend_direction = 1 if trend_pct > 0 else -1
+                    trend_title = "📈 稳步爬升" if trend_direction > 0 else "📉 持续阴跌"
+                    trend_label = (
+                        "1H趋势" if len(cls.rolling_window[symbol]) >= 60
+                        else f"趋势起步({len(cls.rolling_window[symbol])}根1m)"
+                    )
+                    oi_record = cls.oi_cache.get(symbol)
+                    oi_text = ""
+                    if oi_record:
+                        oi_trend = oi_record.get("delta_1h", 0)
+                        oi_value = oi_record["amount"] * price
+                        if abs(oi_trend) > 0.01:
+                            oi_title = "🔥 吸筹" if oi_trend > 0 else "💨 撤退"
+                            oi_text = f"\n资金配合: {oi_title} {oi_trend * 100:+.2f}% (OI窗口)\n总持仓: $" + f"{oi_value:,.0f}"
+                        else:
+                            oi_text = f"\n资金配合: 😐 无明显变化 ({oi_trend * 100:+.2f}%)"
+                    trend_message = (
+                        f"{trend_title} <b>{symbol}</b> ({trend_label})\n"
+                        f"累计幅度: {trend_pct * 100:+.2f}% (近{len(cls.rolling_window[symbol])}根收盘价)\n"
+                        f"现价: {cls._fmt_price(price)}{oi_text}\n"
+                        f"信号: 价格与持仓趋势背景"
+                    )
+                    trend_type = "📈爬升" if trend_direction > 0 else "📉阴跌"
+                    await notifier.save_to_db_now(
+                        symbol, trend_type, trend_message, price, priority="urgent"
+                    )
+                    event = SignalDeduplicator.get_event(symbol)
+                    if event is None:
+                        await notifier.send_urgent(
+                            trend_message, symbol=symbol, signal_type=trend_type,
+                            price=price, save_to_db=False,
+                        )
+                        asyncio.create_task(
+                            notifier.send_chart(
+                                symbol, timeframe="15m",
+                                caption=f"📊 {symbol} 15m K线形态"
+                            )
+                        )
+                    elif event.direction == trend_direction:
+                        SignalDeduplicator.touch_event(symbol)
+
+        if closed:
+            volume_window.append(quote_volume)
+
     @classmethod
     async def _process_kline_3m(cls, k):
         symbol = k.get('s')
