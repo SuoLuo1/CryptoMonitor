@@ -4,6 +4,7 @@
 调用方应先按原始信号限频保存原始报警，再调用 arbitrate() 判断是否推送。
 """
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -20,6 +21,10 @@ class EventState:
     event_high_ts: float
     event_low: float
     event_low_ts: float
+    # 用独立 event_id 把同一轮行情的决策日志关联起来。
+    event_id: str
+    # last_activity_time 用于事件空闲过期；last_material_time 只记录实质价格推进。
+    last_activity_time: float
     last_material_time: float
     last_material_price: float
     last_1m_time: float = 0.0
@@ -44,7 +49,7 @@ class SignalDeduplicator:
     @classmethod
     def _expire_if_idle(cls, symbol: str, now: float) -> Optional[EventState]:
         event = cls.active_events.get(symbol)
-        if event is not None and now - event.last_material_time >= EVENT_IDLE_CLOSE:
+        if event is not None and now - event.last_activity_time >= EVENT_IDLE_CLOSE:
             del cls.active_events[symbol]
             return None
         return event
@@ -68,6 +73,8 @@ class SignalDeduplicator:
             event_high_ts=now,
             event_low=price,
             event_low_ts=now,
+            event_id=uuid.uuid4().hex[:10],
+            last_activity_time=now,
             last_material_time=now,
             last_material_price=price,
             notif_initial=True,
@@ -84,7 +91,7 @@ class SignalDeduplicator:
     def observe_price(
         cls, symbol: str, price: float, now: Optional[float] = None
     ) -> Optional[EventState]:
-        """更新事件极值；同方向价格至少推进 1% 才刷新沉寂计时。"""
+        """更新事件极值；价格推进与事件活跃计时分开记录。"""
         current_time = time.time() if now is None else now
         event = cls._expire_if_idle(symbol, current_time)
         if event is None or price <= 0:
@@ -108,6 +115,7 @@ class SignalDeduplicator:
             if material_move:
                 event.last_material_time = current_time
                 event.last_material_price = price
+                event.last_activity_time = current_time
         return event
 
     @classmethod
@@ -116,7 +124,7 @@ class SignalDeduplicator:
         current_time = time.time() if now is None else now
         event = cls._expire_if_idle(symbol, current_time)
         if event is not None:
-            event.last_material_time = current_time
+            event.last_activity_time = current_time
 
     @classmethod
     def _is_linked(cls, event: EventState, now: float) -> bool:
@@ -145,6 +153,9 @@ class SignalDeduplicator:
 
             if price > 0:
                 cls.observe_price(symbol, price, now)
+            # 新的同方向原始信号本身也说明行情仍在活动。
+            # 不要求价格先走满 1%，否则连续每分钟触发的同一波异动可能被误切成新事件。
+            event.last_activity_time = now
             if signal_kind == "initial_1m":
                 event.last_1m_time = now
             else:
@@ -156,7 +167,7 @@ class SignalDeduplicator:
                     and not event.notif_confirmation
                 ):
                     event.notif_confirmation = True
-                    event.last_material_time = now
+                    event.last_activity_time = now
                     return True, "oi_3m_confirm"
             return False, "same_direction_event"
 
@@ -166,19 +177,20 @@ class SignalDeduplicator:
 
             if signal_kind == "oi_base":
                 event.oi_base_recorded_ts = now
+                event.last_activity_time = now
                 if (
                     event.last_3m_time > 0
                     and now - event.last_3m_time <= EVENT_LINK_WINDOW
                     and not event.notif_confirmation
                 ):
                     event.notif_confirmation = True
-                    event.last_material_time = now
+                    event.last_activity_time = now
                     return True, "oi_3m_confirm"
                 return False, "oi_base_attached"
 
+            event.last_activity_time = now
             if not event.notif_confirmation:
                 event.notif_confirmation = True
-                event.last_material_time = now
                 return True, "oi_strong"
             return False, "confirmation_already_sent"
 
@@ -190,6 +202,7 @@ class SignalDeduplicator:
             if event.notif_reverse_shock:
                 return False, "reverse_shock_already_sent"
             event.notif_reverse_shock = True
+            event.last_activity_time = now
             return True, "reverse_shock"
 
         return False, "unknown_signal_kind"
