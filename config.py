@@ -1,10 +1,10 @@
 # config.py
-
+import os
 # Telegram
-TG_BOT_TOKEN = "8462655201:AAEPI0yXTt2LpnwzxybmtmIldF8lWhC9WTo"
-TG_CHAT_ID = "2014554417"
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-DEEPSEEK_API_KEY = "sk-11c03a0e08884bd78bfe0a3f5797fb73" #deepseek 私钥
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 LLM_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
@@ -62,3 +62,13 @@ BINANCE_HTTP_FUTURES = "https://fapi.binance.com"
 # 币安 WebSocket URL（新架构：/market 用于常规市场数据 ticker/kline/markPrice/aggTrade）
 BINANCE_WS_FUTURES_COMBINED = "wss://fstream.binance.com/market/stream?streams="
 BINANCE_WS_FUTURES_RAW = "wss://fstream.binance.com/market/ws"
+
+# === 事件级报警去重 (Milestone 1) ===
+EVENT_LINK_WINDOW = 180          # 关联窗口：1m / 3m / OI 证据之间最多相隔 180 秒
+EVENT_IDLE_CLOSE = 300           # 活动事件连续 300 秒无有效变化后关闭
+EVENT_MATERIAL_MOVE_PCT = 0.01   # 同方向新极值至少移动 1%，才刷新事件活跃时间
+OI_STRONG_MULTIPLIER = 1.5       # OI 强升级阈值 = 基础阈值 × 1.5
+OI_MAX_STALENESS = 120           # OI 数据最大允许延迟（秒）
+REVERSE_SHOCK_PCT = 0.04         # 从事件高点/低点反向移动至少 4%
+REVERSE_SHOCK_VOL_RATIO = 2.0    # 当前 1m 成交额至少为此前 5 根已收盘 1m 均量的 2 倍
+DB_DEDUP_COOLDOWN = 60           # 保留原有同类原始信号入库限频，避免 Top 计数被 WS 更新放大
