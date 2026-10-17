@@ -2,6 +2,7 @@
 import asyncio
 import gc
 import io
+import json
 import re
 from datetime import datetime
 
@@ -190,7 +191,8 @@ class TelegramNotifier:
         )
 
     async def send_urgent(
-        self, msg, *, symbol=None, signal_type=None, price=None, save_to_db=True
+        self, msg, *, symbol=None, signal_type=None, price=None,
+        save_to_db=True, trace_id=None
     ):
         """紧急推送。默认兼容旧调用（先入库再发送）；新事件流显式传 save_to_db=False。"""
         if save_to_db:
@@ -212,14 +214,26 @@ class TelegramNotifier:
 
         logger.info(f"🔥 [send_urgent] 收到紧急消息：{msg[:50]}...")
         try:
-            self.queue.put_nowait(msg)
-            logger.info(f"✅ [send_urgent] 消息已放入队列，当前队列大小：{self.queue.qsize()}")
+            # 将追踪 ID 与消息一起入队，后续即使聚合发送也能反查实际 TG message_id。
+            self.queue.put_nowait({"text": msg, "trace_id": trace_id})
+            logger.info(
+                f"[TG_QUEUE] trace_id={trace_id or '-'} status=accepted "
+                f"queue_size={self.queue.qsize()}"
+            )
             print(f"[🔥URGENT] {msg[:20]}...")
+            return True
         except asyncio.QueueFull:
-            logger.error("❌ [send_urgent] 紧急队列已满，消息丢弃！")
+            logger.error(
+                f"[TG_QUEUE] trace_id={trace_id or '-'} status=dropped reason=queue_full"
+            )
             print("[DROP] 紧急队列满")
+            return False
         except Exception as e:
-            logger.error(f"❌ [send_urgent] 异常：{e}", exc_info=True)
+            logger.error(
+                f"[TG_QUEUE] trace_id={trace_id or '-'} status=error error={e}",
+                exc_info=True,
+            )
+            return False
 
     def _build_top_ranked_msg(self, current_symbol, current_signal_type, current_msg):
         """
@@ -635,19 +649,35 @@ class TelegramNotifier:
     async def _urgent_worker(self):
         while self.running:
             try:
-                msgs = []
-                msgs.append(await self.queue.get())
+                queued_items = [await self.queue.get()]
                 # 稍微聚合一下紧急的，比如 0.5秒内连发了两条暴跌
                 for _ in range(2):
-                    if self.queue.empty(): break
-                    msgs.append(self.queue.get_nowait())
+                    if self.queue.empty():
+                        break
+                    queued_items.append(self.queue.get_nowait())
 
-                if not msgs: continue
-                text = "\n\n".join(msgs)
-                await self._send_to_tg(text)
+                messages = []
+                trace_ids = []
+                for item in queued_items:
+                    # 兼容旧式直接入队的纯字符串消息。
+                    if isinstance(item, dict):
+                        message = item.get("text", "")
+                        trace_id = item.get("trace_id")
+                    else:
+                        message = str(item)
+                        trace_id = None
+                    if message:
+                        messages.append(message)
+                    if trace_id:
+                        trace_ids.append(str(trace_id))
+
+                if not messages:
+                    continue
+                text = "\n\n".join(messages)
+                await self._send_to_tg(text, trace_ids=trace_ids)
                 await asyncio.sleep(0.5)  # 紧急通道稍微快点
             except Exception as e:
-                logger.error(f"Urgent Worker Err: {e}")
+                logger.error(f"Urgent Worker Err: {e}", exc_info=True)
 
     # --- 任务 2: 定时总结循环---
     async def _buffer_flush_loop(self):
@@ -710,15 +740,20 @@ class TelegramNotifier:
             #         await self._send_to_tg(full_text)
 
     # --- 底层发送逻辑 ---
-    async def _send_to_tg(self, text):
+    async def _send_to_tg(self, text, trace_ids=None):
         """
-        【修复】加重试上限，避免 TG 不可达时死磕导致连接堆积
+        【修复】加重试上限，避免 TG 不可达时死磕导致连接堆积。
+        trace_ids 为本次聚合消息包含的信号追踪 ID。
         """
+        trace_ids = trace_ids or []
+        trace_label = ",".join(trace_ids) if trace_ids else "-"
         if not text:
             logger.warning("⚠️ [_send_to_tg] 消息为空，跳过")
             return
         if self.session is None or self.session.closed:
-            logger.error(f"❌ [_send_to_tg] Session 已关闭！无法发送。session={self.session}, closed={self.session.closed if self.session else 'None'}")
+            logger.error(
+                f"[TG_DELIVERY] trace_ids={trace_label} status=failed reason=session_closed"
+            )
             return
 
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -732,22 +767,42 @@ class TelegramNotifier:
                 async with self.session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     response_text = await resp.read()
                     if resp.status == 200:
-                        logger.info(f"✅ [_send_to_tg] 发送成功 (attempt {attempt})")
+                        message_id = None
+                        try:
+                            response_json = json.loads(response_text.decode("utf-8"))
+                            message_id = response_json.get("result", {}).get("message_id")
+                        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                            pass
+                        logger.info(
+                            f"[TG_DELIVERY] trace_ids={trace_label} status=success "
+                            f"telegram_message_id={message_id or '-'} attempt={attempt} "
+                            f"batched_messages={len(trace_ids) or 1}"
+                        )
                         return
-                    logger.error(f"❌ [_send_to_tg] 非 200 ({attempt}/{MAX_RETRIES}): {resp.status} body={response_text[:200]}")
+                    logger.error(
+                        f"[TG_DELIVERY] trace_ids={trace_label} status=http_error "
+                        f"attempt={attempt}/{MAX_RETRIES} http_status={resp.status} "
+                        f"body={response_text[:200]}"
+                    )
                     last_err = f"HTTP {resp.status}"
                     # 4xx 是参数问题，不再重试
                     if 400 <= resp.status < 500:
                         break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.warning(f"⚠️ [_send_to_tg] 网络异常 ({attempt}/{MAX_RETRIES}): {e}")
+                logger.warning(
+                    f"[TG_DELIVERY] trace_ids={trace_label} status=network_error "
+                    f"attempt={attempt}/{MAX_RETRIES} error={e}"
+                )
                 last_err = str(e)
             # 指数退避后重试
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(2 ** attempt)
 
         # 全部失败：进 dead-letter，不再阻塞
-        logger.error(f"❌ [_send_to_tg] 彻底失败 ({MAX_RETRIES}次)，丢弃消息进 dead-letter: last_err={last_err}, text={text[:80]}")
+        logger.error(
+            f"[TG_DELIVERY] trace_ids={trace_label} status=failed "
+            f"attempts={MAX_RETRIES} error={last_err} text={text[:80]}"
+        )
         # TODO: 写入本地 dead-letter 文件供事后回溯
 
 
