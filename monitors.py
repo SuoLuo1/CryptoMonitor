@@ -153,6 +153,7 @@ class Monitors:
             signal_type=signal_type,
             price=price,
             save_to_db=False,
+            trace_id=trace_id,
         )
         # 图表只随首条价格信号发送，确认/升级不重复生成图表。
         if chart and reason in ("initial_1m", "initial_3m"):
@@ -443,7 +444,7 @@ class Monitors:
                         )
                         await notifier.send_urgent(
                             trend_message, symbol=symbol, signal_type=trend_type,
-                            price=price, save_to_db=False,
+                            price=price, save_to_db=False, trace_id=trend_trace,
                         )
                         asyncio.create_task(
                             notifier.send_chart(
