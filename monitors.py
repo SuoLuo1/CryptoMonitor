@@ -5,6 +5,7 @@ from collections import deque
 
 from config import *
 from utils import notifier
+from signal_deduplicator import SignalDeduplicator
 
 
 class Monitors:
@@ -38,6 +39,7 @@ class Monitors:
     oi_window = {}
     # 3m K线成交量窗口 (存前5根已收盘K线的成交额, 用于放量确认)
     vol_window_3m = {}
+    vol_window_1m = {}  # 前5根已收盘1m K线成交额，用于反向冲击确认
     # 设定窗口大小：60 分钟 (看过去 60根 1m K线 = 1小时趋势)
     WINDOW_SIZE = 60
     # 设定趋势阈值：1小时累计涨跌超过 5%
