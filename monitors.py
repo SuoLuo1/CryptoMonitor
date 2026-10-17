@@ -119,11 +119,23 @@ class Monitors:
         price, *, chart=False, buffered=False
     ):
         """所有事件信号先入库，再独立裁决是否推送，确保被抑制信号仍进入历史统计。"""
-        await notifier.save_to_db_now(
+        db_result = await notifier.save_to_db_now(
             symbol, signal_type, msg, price, priority="urgent"
         )
+        db_status = "ok" if db_result and db_result[0] else "failed"
         allow, reason = SignalDeduplicator.arbitrate(
             signal_kind, symbol, direction, evidence
+        )
+        event = SignalDeduplicator.active_events.get(symbol)
+        event_id = event.event_id if event is not None else "-"
+        timestamp = float(evidence.get("timestamp", time.time()))
+        trace_id = f"{symbol}:{int(timestamp * 1000)}:{signal_kind}"
+        decision = "ALLOW" if allow else "SUPPRESS"
+        print(
+            f"[SIGNAL_TRACE] ts={timestamp:.3f} trace_id={trace_id} "
+            f"event_id={event_id} symbol={symbol} kind={signal_kind} "
+            f"direction={direction:+d} decision={decision} reason={reason} "
+            f"db={db_status} price={price}"
         )
         if not allow:
             print(f"[DEDUP] {symbol} {signal_kind} 抑制推送：{reason}")
@@ -411,6 +423,12 @@ class Monitors:
                     )
                     event = SignalDeduplicator.get_event(symbol)
                     if event is None:
+                        trend_trace = f"{symbol}:{int(time.time() * 1000)}:trend"
+                        print(
+                            f"[SIGNAL_TRACE] trace_id={trend_trace} symbol={symbol} "
+                            f"kind=trend decision=ALLOW reason=no_active_event "
+                            f"event_id=- db=ok price={price}"
+                        )
                         await notifier.send_urgent(
                             trend_message, symbol=symbol, signal_type=trend_type,
                             price=price, save_to_db=False,
@@ -423,6 +441,17 @@ class Monitors:
                         )
                     elif event.direction == trend_direction:
                         SignalDeduplicator.touch_event(symbol)
+                        print(
+                            f"[SIGNAL_TRACE] symbol={symbol} kind=trend "
+                            f"decision=SUPPRESS reason=attached_to_event "
+                            f"event_id={event.event_id} db=ok price={price}"
+                        )
+                    else:
+                        print(
+                            f"[SIGNAL_TRACE] symbol={symbol} kind=trend "
+                            f"decision=SUPPRESS reason=opposite_active_event "
+                            f"event_id={event.event_id} db=ok price={price}"
+                        )
 
         if closed:
             volume_window.append(quote_volume)
