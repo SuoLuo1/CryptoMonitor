@@ -42,6 +42,31 @@ network access, credentials, or runtime services. Local checks are limited to
 static validation of the synchronization tooling unless the task explicitly
 requires otherwise.
 
+## systemd service 与凭据管理
+
+CryptoMonitor 通过 `/etc/systemd/system/cryptomonitor.service` 由 systemd 托管。
+service 单元的内容不在 git 中跟踪，由 `deploy/systemd-install.sh` 从模板 + 凭据渲染生成。
+
+**凭据直接写入 service 单元的 `Environment=` 行**（单一事实源）。重装 / 迁移主机时，
+只需要重跑 `deploy/systemd-install.sh` 即可重建完整运行环境，不必再额外管理外部凭据文件。
+
+`.env.example` 是可选模板文件，仅当你需要把凭据“临时”喂给 service 安装脚本时使用，
+或当你想在 shell 手动测试 `set -a && . ./.env && set +a` 时使用。
+
+新装机器复现步骤（推荐）：
+
+1. `sudo cp .env.example .env && sudo $EDITOR .env`（仅当走 .env → service 注入路径时）
+2. `chmod 600 .env`，避免凭据被其他进程读取
+3. `sudo bash deploy/systemd-install.sh`，幂等安装 / 更新 service 单元
+   - 脚本会读取 `.env`（如有）→ 渲染进 service 单元
+   - 找不到 `.env` 时会交互式问三个值，直接 TG 也行
+4. `systemctl status cryptomonitor.service` 确认 active
+
+`systemd-install.sh` 是幂等的，重复跑不会破坏现有 service；只在用户确认后才覆写 service。
+脚本改 service 内容时自动 `daemon-reload` + `restart`，无变化时保持现有 PID 不动。
+
+脱敏：`systemd-install.sh` 在覆盖前会显示 redacted diff（`Environment=... ***`），不会打印真实凭据。
+
 ## Git commits
 
 - Use the repository's existing conventional style: `feat:`, `fix:`,
