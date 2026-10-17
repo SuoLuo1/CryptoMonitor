@@ -496,74 +496,89 @@ class Monitors:
 
     @classmethod
     async def process_oi_change_wrapper(cls, data):
-        symbol = data['symbol']
-        current_oi = float(data['openInterest'])
+        symbol = data["symbol"]
+        current_oi = float(data["openInterest"])
         current_time = time.time()
+
         if symbol not in cls.oi_window:
             cls.oi_window[symbol] = deque(maxlen=60)
         cls.oi_window[symbol].append(current_oi)
         oi_trend_1h = 0.0
-        if len(cls.oi_window[symbol]) >= 30:  # 数据积累够了才算（至少半小时数据）
-            start_oi = cls.oi_window[symbol][0]  # 1小时前的 OI
+        if len(cls.oi_window[symbol]) >= 30:
+            start_oi = cls.oi_window[symbol][0]
             if start_oi > 0:
                 oi_trend_1h = (current_oi - start_oi) / start_oi
 
-        # 1. 获取实时价格 (从 WebSocket 缓存拿)
         price = cls._get_current_price(symbol)
-        if price == 0: return  # 没价格没法算 U，跳过
+        if price <= 0:
+            return
 
-        # 2. 读取上一次 OI
+        # 先用上一份有效采样计算 delta 和采样年龄，再刷新缓存。
         last_record = cls.oi_cache.get(symbol)
         delta_pct = 0.0
-        if last_record and last_record['amount'] > 0:
-            delta_pct = (current_oi - last_record['amount']) / last_record['amount']
+        sample_age = None
+        if last_record and last_record["amount"] > 0:
+            delta_pct = (current_oi - last_record["amount"]) / last_record["amount"]
+            sample_age = current_time - last_record["time"]
 
-        # 3. 无论是否报警，都要更新缓存 (供 K线监控 读取!)
         cls.oi_cache[symbol] = {
-            'amount': current_oi,
-            'time': current_time,
-            'delta': delta_pct,
-            'delta_1h': oi_trend_1h
+            "amount": current_oi,
+            "time": current_time,
+            "delta": delta_pct,
+            "delta_1h": oi_trend_1h,
         }
-        if (current_oi * price) < MIN_OI_VALUE:
+
+        if current_oi * price < MIN_OI_VALUE or last_record is None:
             return
-        if not last_record: return
+        if sample_age is None or sample_age > OI_MAX_STALENESS:
+            return
 
-        # 4. 计算变化
-        if current_time - last_record['time'] > 120: return  # 数据太旧不对比
+        base_threshold = cls._get_oi_threshold(symbol)
+        if abs(delta_pct) <= base_threshold:
+            return
 
-        dynamic_threshold = cls._get_oi_threshold(symbol)
-        # 阈值过滤 (比如 5%)
-        if abs(delta_pct) > dynamic_threshold:
-            if cls._check_cooldown(f"{symbol}_OI", 60):
-                # 就算 OI 是 1分钟前的，价格我们用的是最新的，所以价值是准的
-                oi_val = current_oi * price
-                delta_val = (current_oi - last_record['amount']) * price
+        strong_threshold = base_threshold * OI_STRONG_MULTIPLIER
+        signal_kind = "oi_strong" if abs(delta_pct) > strong_threshold else "oi_base"
+        oi_direction = 1 if delta_pct > 0 else -1
+        direction_name = "UP" if oi_direction > 0 else "DOWN"
+        level_name = "STRONG" if signal_kind == "oi_strong" else "BASE"
+        # 基础档和强档各自限频，确保基础档不会挡住随后到来的强升级档。
+        if not cls._check_cooldown(
+            f"{symbol}_OI_{level_name}_{direction_name}", DB_DEDUP_COOLDOWN
+        ):
+            return
 
-                direction = "📈 增仓" if delta_pct > 0 else "📉 减仓"
-                kline_str = ""
-                last_kline_pct = cls.kline_stats.get(symbol)
-                if last_kline_pct is not None:
-                    k_emoji = "🔴" if last_kline_pct < 0 else "🟢"
-                    kline_str = f"\n对应币价: {k_emoji} {last_kline_pct * 100:+.2f}% (1m)"
+        oi_value = current_oi * price
+        delta_value = (current_oi - last_record["amount"]) * price
+        direction_text = "📈 增仓" if delta_pct > 0 else "📉 减仓"
+        last_kline_pct = cls.kline_stats.get(symbol)
+        kline_text = ""
+        if last_kline_pct is not None:
+            kline_emoji = "🔴" if last_kline_pct < 0 else "🟢"
+            kline_text = f"\n对应币价: {kline_emoji} {last_kline_pct * 100:+.2f}% (1m)"
 
-                msg = (f"📊 持仓异动 (1m): <b>{symbol}</b>\n"
-                    f"方向: {direction} {delta_pct * 100:.2f}%\n"
-                    f"变动: ${delta_val:,.0f}\n"
-                    f"总量: ${oi_val:,.0f}\n"
-                    f"现价: {cls._fmt_price(price)}"
-                    f"{kline_str}"
-                )
-                await notifier.send_urgent(msg)
-                asyncio.create_task(
-                    notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
-                )
-                if symbol in cls.vip_symbols:
-                    await notifier.send_buffered(msg)
+        level_text = "强异动" if signal_kind == "oi_strong" else "异动"
+        message = (
+            f"📊 持仓{level_text} (采样间隔{sample_age:.0f}s): <b>{symbol}</b>\n"
+            f"方向: {direction_text} {delta_pct * 100:+.2f}%\n"
+            f"变动: $" + f"{delta_value:,.0f}" + "\n"
+            f"总量: $" + f"{oi_value:,.0f}" + "\n"
+            f"现价: {cls._fmt_price(price)}{kline_text}"
+        )
+        evidence = {
+            "timestamp": current_time,
+            "price": price,
+            "oi_delta": delta_pct,
+            "oi_value": oi_value,
+            "oi_base_threshold": base_threshold,
+            "oi_strong_threshold": strong_threshold,
+            "sample_age": sample_age,
+        }
+        await cls._record_event_signal(
+            signal_kind, symbol, oi_direction, evidence, message,
+            "📊OI异动", price, chart=False, buffered=True,
+        )
 
-    # ---------------------------------------------------------
-    # 3. 逐笔成交处理
-    # ---------------------------------------------------------
     @classmethod
     async def process_agg_trade(cls, data):
         symbol = data['s']
