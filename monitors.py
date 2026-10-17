@@ -429,64 +429,71 @@ class Monitors:
 
     @classmethod
     async def _process_kline_3m(cls, k):
-        symbol = k.get('s')
-        if not symbol: return
-        kline_vol = float(k['q'])  # 本根成交额 (USDT)
-        if kline_vol < 5000:
+        symbol = k.get("s")
+        if not symbol:
+            return
+        try:
+            quote_volume = float(k["q"])
+            open_price = float(k["o"])
+            price = float(k["c"])
+            closed = bool(k["x"])
+        except (KeyError, TypeError, ValueError):
             return
 
-        # 维护前5根已收盘K线的成交额窗口
-        if symbol not in cls.vol_window_3m:
-            cls.vol_window_3m[symbol] = deque(maxlen=5)
-        if k['x']:  # K线收盘 -> 存入窗口, 本根不做信号判断(收盘才判断会滞后3分钟)
-            cls.vol_window_3m[symbol].append(kline_vol)
+        volume_window = cls.vol_window_3m.setdefault(symbol, deque(maxlen=5))
+        # 收盘时只更新基准，当前未收盘的 K 线才参与实时异动判断。
+        if closed:
+            volume_window.append(quote_volume)
+            return
+        if quote_volume < 5000 or open_price <= 0 or len(volume_window) < 5:
             return
 
-        vol_window = cls.vol_window_3m[symbol]
-        if len(vol_window) < 5:  # 历史量不足, 无法确认放量
-            return
-
-        open_p = float(k['o'])
-        close_p = float(k['c'])
-        if open_p <= 0: return
-        change_pct = (close_p - open_p) / open_p
+        change_pct = (price - open_price) / open_price
         if abs(change_pct) <= PUMP_3M_THRESHOLD:
             return
-
-        # 放量确认: 本根成交额 > 前5根均量 * 3
-        vol_ma5 = sum(vol_window) / len(vol_window)
-        if vol_ma5 <= 0 or kline_vol < vol_ma5 * VOL_MA5_MULTIPLIER:
+        mean_volume = sum(volume_window) / len(volume_window)
+        if mean_volume <= 0 or quote_volume < mean_volume * VOL_MA5_MULTIPLIER:
             return
 
-        direction = "PUMP" if change_pct > 0 else "DUMP"
-        if cls._check_cooldown(f"{symbol}_3M_{direction}", 60):
-            emoji = "🚀 暴涨" if change_pct > 0 else "🩸 暴跌"
-            vol_ratio = kline_vol / vol_ma5
-            oi_qty, oi_time, delta = cls._get_last_oi(symbol)
-            oi_str = ""
-            if oi_qty > 0:
-                oi_val = oi_qty * close_p
-                lag = int(time.time() - oi_time)
-                oi_str = f"\n持仓总量: ${oi_val:,.0f} ({lag}s前)"
-                if delta is not None:
-                    oi_emoji = "🔥 激增" if delta > 0.02 else ("📉 骤减" if delta < -0.02 else "➡️")
-                    oi_str += f"\n持仓变化: {oi_emoji} {delta * 100:+.2f}%"
-            msg = (f"{emoji} <b>{symbol}</b> (3m放量)\n"
-                   f"幅度: {change_pct * 100:.2f}%\n"
-                   f"放量: {vol_ratio:.1f}x (vs 前5根均量)\n"
-                   f"成交额: ${kline_vol:,.0f}\n"
-                   f"现价: {cls._fmt_price(close_p)}"
-                   f"{oi_str}")
+        direction = 1 if change_pct > 0 else -1
+        direction_name = "UP" if direction > 0 else "DOWN"
+        if not cls._check_cooldown(
+            f"{symbol}_3M_RAW_{direction_name}", DB_DEDUP_COOLDOWN
+        ):
+            return
 
-            # 【双发模式】与1m信号一致
-            await notifier.send_urgent(msg)
-            asyncio.create_task(
-                notifier.send_chart(symbol, timeframe="15m", caption=f"📊 {symbol} 15m K线形态")
-            )
-            if symbol in cls.vip_symbols:
-                await notifier.send_buffered(msg)
+        emoji = "🚀 暴涨" if direction > 0 else "🩸 暴跌"
+        volume_ratio = quote_volume / mean_volume
+        oi_amount, oi_time, oi_delta = cls._get_last_oi(symbol)
+        oi_text = ""
+        if oi_amount > 0:
+            oi_value = oi_amount * price
+            lag = max(0, int(time.time() - oi_time))
+            oi_text = f"\n持仓总量: $" + f"{oi_value:,.0f} ({lag}s前)"
+            if oi_delta is not None:
+                oi_emoji = "🔥 激增" if oi_delta > 0.02 else ("📉 骤减" if oi_delta < -0.02 else "➡️")
+                oi_text += f"\n持仓变化: {oi_emoji} {oi_delta * 100:+.2f}%"
 
-    # 6. 持仓量处理 (OI 触发 -> 带上实时价格算金额)
+        message = (
+            f"{emoji} <b>{symbol}</b> (3m放量)\n"
+            f"幅度: {change_pct * 100:.2f}%\n"
+            f"放量: {volume_ratio:.1f}x (vs 前5根均量)\n"
+            f"成交额: $" + f"{quote_volume:,.0f}" + "\n"
+            f"现价: {cls._fmt_price(price)}{oi_text}"
+        )
+        evidence = {
+            "timestamp": time.time(),
+            "price": price,
+            "change_pct": change_pct,
+            "vol_ratio": volume_ratio,
+            "quote_volume": quote_volume,
+        }
+        signal_type = "🚀暴涨3m" if direction > 0 else "🩸暴跌3m"
+        await cls._record_event_signal(
+            "initial_3m", symbol, direction, evidence, message,
+            signal_type, price, chart=True, buffered=True,
+        )
+
     @classmethod
     async def process_oi_change_wrapper(cls, data):
         symbol = data['symbol']
