@@ -380,8 +380,19 @@ class Monitors:
                 }
                 if shock_sent:
                     # 强反向冲击已通知，本次方向信号只入库，避免一根 K 线双发。
-                    await notifier.save_to_db_now(
+                    db_result = await notifier.save_to_db_now(
                         symbol, signal_type, message, price, priority="urgent"
+                    )
+                    db_status = "ok" if db_result and db_result[0] else "failed"
+                    timestamp = time.time()
+                    trace_id = f"{symbol}:{int(timestamp * 1000)}:initial_1m"
+                    event = SignalDeduplicator.active_events.get(symbol)
+                    event_id = event.event_id if event is not None else "-"
+                    print(
+                        f"[SIGNAL_TRACE] ts={timestamp:.3f} trace_id={trace_id} "
+                        f"event_id={event_id} symbol={symbol} kind=initial_1m "
+                        f"direction={direction:+d} decision=SUPPRESS "
+                        f"reason=reverse_shock_sent_same_bar db={db_status} price={price}"
                     )
                 else:
                     await cls._record_event_signal(
@@ -418,16 +429,17 @@ class Monitors:
                         f"信号: 价格与持仓趋势背景"
                     )
                     trend_type = "📈爬升" if trend_direction > 0 else "📉阴跌"
-                    await notifier.save_to_db_now(
+                    trend_db_result = await notifier.save_to_db_now(
                         symbol, trend_type, trend_message, price, priority="urgent"
                     )
+                    trend_db_status = "ok" if trend_db_result and trend_db_result[0] else "failed"
                     event = SignalDeduplicator.get_event(symbol)
                     if event is None:
                         trend_trace = f"{symbol}:{int(time.time() * 1000)}:trend"
                         print(
                             f"[SIGNAL_TRACE] trace_id={trend_trace} symbol={symbol} "
                             f"kind=trend decision=ALLOW reason=no_active_event "
-                            f"event_id=- db=ok price={price}"
+                            f"event_id=- db={trend_db_status} price={price}"
                         )
                         await notifier.send_urgent(
                             trend_message, symbol=symbol, signal_type=trend_type,
@@ -444,13 +456,13 @@ class Monitors:
                         print(
                             f"[SIGNAL_TRACE] symbol={symbol} kind=trend "
                             f"decision=SUPPRESS reason=attached_to_event "
-                            f"event_id={event.event_id} db=ok price={price}"
+                            f"event_id={event.event_id} db={trend_db_status} price={price}"
                         )
                     else:
                         print(
                             f"[SIGNAL_TRACE] symbol={symbol} kind=trend "
                             f"decision=SUPPRESS reason=opposite_active_event "
-                            f"event_id={event.event_id} db=ok price={price}"
+                            f"event_id={event.event_id} db={trend_db_status} price={price}"
                         )
 
         if closed:
