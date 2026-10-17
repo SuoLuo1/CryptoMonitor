@@ -471,7 +471,9 @@ class TelegramNotifier:
 
             if price is None:
                 # 支持科学计数法和正负指数。
-                price_match = re.search(r"现价：?\s*([0-9.eE+-]+)", msg)
+                price_match = re.search(r"现价：\s*([0-9.eE+-]+)", msg)
+                if not price_match:
+                    price_match = re.search(r"现价:\s*([0-9.eE+-]+)", msg)
                 if not price_match:
                     price_match = re.search(r"\$([0-9.eE+-]+)", msg)
                 if price_match:
