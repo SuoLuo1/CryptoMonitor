@@ -649,33 +649,24 @@ class TelegramNotifier:
     async def _urgent_worker(self):
         while self.running:
             try:
-                queued_items = [await self.queue.get()]
-                # 稍微聚合一下紧急的，比如 0.5秒内连发了两条暴跌
-                for _ in range(2):
-                    if self.queue.empty():
-                        break
-                    queued_items.append(self.queue.get_nowait())
-
-                messages = []
-                trace_ids = []
-                for item in queued_items:
+                item = await self.queue.get()
+                # 一条队列消息对应一次 Telegram 请求。
+                # 每条消息本身可能已经包含近 12h Top 排行（约 3.7k 字符）；
+                # 再把 2-3 条拼起来会超过 Telegram 4096 字符限制，导致整批报警全部丢失。
+                if isinstance(item, dict):
+                    message = item.get("text", "")
+                    trace_id = item.get("trace_id")
+                else:
                     # 兼容旧式直接入队的纯字符串消息。
-                    if isinstance(item, dict):
-                        message = item.get("text", "")
-                        trace_id = item.get("trace_id")
-                    else:
-                        message = str(item)
-                        trace_id = None
-                    if message:
-                        messages.append(message)
-                    if trace_id:
-                        trace_ids.append(str(trace_id))
+                    message = str(item)
+                    trace_id = None
 
-                if not messages:
+                if not message:
                     continue
-                text = "\n\n".join(messages)
-                await self._send_to_tg(text, trace_ids=trace_ids)
-                await asyncio.sleep(0.5)  # 紧急通道稍微快点
+
+                trace_ids = [str(trace_id)] if trace_id else []
+                await self._send_to_tg(message, trace_ids=trace_ids)
+                await asyncio.sleep(0.5)  # 控制紧急通道发送速率
             except Exception as e:
                 logger.error(f"Urgent Worker Err: {e}", exc_info=True)
 
@@ -762,6 +753,7 @@ class TelegramNotifier:
 
         MAX_RETRIES = 3
         last_err = None
+        attempt = 0
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with self.session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -801,7 +793,7 @@ class TelegramNotifier:
         # 全部失败：进 dead-letter，不再阻塞
         logger.error(
             f"[TG_DELIVERY] trace_ids={trace_label} status=failed "
-            f"attempts={MAX_RETRIES} error={last_err} text={text[:80]}"
+            f"attempts={attempt} error={last_err} text={text[:80]}"
         )
         # TODO: 写入本地 dead-letter 文件供事后回溯
 
