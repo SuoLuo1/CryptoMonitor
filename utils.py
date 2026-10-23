@@ -4,6 +4,7 @@ import gc
 import io
 import json
 import re
+import time
 from datetime import datetime
 
 import aiohttp
@@ -174,6 +175,8 @@ class TelegramNotifier:
         asyncio.create_task(self._urgent_worker())
         # 2. 负责每分钟总结非紧急消息
         asyncio.create_task(self._buffer_flush_loop())
+        # 3. 🐾 Top 心跳: 市场安静时也定期推一次最新 Top (主人 10-24)
+        asyncio.create_task(self._top_heartbeat_loop())
         logger.info("✅ TelegramNotifier 已启动 (连接池限制: 10)")
 
     async def stop(self):
@@ -217,6 +220,8 @@ class TelegramNotifier:
                     f"{trace_id}#part{idx + 1}" if trace_id else None
                 )
                 self._enqueue_one(one_msg, one_trace)
+            # 🐾 信号推送也刷新心跳计时, 避免心跳紧接着再推一遍 (主人 10-24)
+            self._last_top_push_ts = time.time()
             return True
 
         return self._enqueue_one(msg, trace_id)
@@ -326,7 +331,12 @@ class TelegramNotifier:
             lines.append(line)
 
         # 4. 分批: 每批最多 TOP_BATCH_ROWS 行, 且不超过 TG 安全长度
-        separator = f"\n────── {current_signal_type} 当前信号：{current_symbol} ──────\n"
+        # 🐾 心跳模式 (current_msg is None): 纯 Top 列表, 没有"当前信号"分隔段
+        is_heartbeat = current_msg is None
+        separator = (
+            "" if is_heartbeat
+            else f"\n────── {current_signal_type} 当前信号：{current_symbol} ──────\n"
+        )
         batches = []
         current_batch = []
         current_len = len(header)
@@ -334,7 +344,7 @@ class TelegramNotifier:
         for line in lines:
             line_len = len(line) + 1
             # 最后一批要额外容纳 separator + 当前信号正文
-            reserve = len(separator) + len(current_msg) if not batches else 0
+            reserve = 0 if is_heartbeat else len(separator) + len(current_msg)
             would_exceed_rows = len(current_batch) >= self.TOP_BATCH_ROWS
             would_exceed_len = current_len + line_len + reserve > self.TG_SAFE_LIMIT
 
@@ -362,8 +372,16 @@ class TelegramNotifier:
                     f"(第 {idx + 1}/{total_batches} 批)\n"
                     "═══════════════════════════════\n"
                 )
+            elif is_heartbeat:
+                # 🐾 心跳消息头部标注, 让主人知道这是定期刷新而非新信号
+                batch_header = (
+                    "═══════════════════════════════\n"
+                    f"📊 今日所有信号 Top ({now_str}) · 共 {len(top_list)} 个币 "
+                    f"(定期刷新 · 市场平静)\n"
+                    "═══════════════════════════════\n"
+                )
             text = batch_header + "\n".join(batch_lines)
-            if is_last:
+            if is_last and not is_heartbeat:
                 text += separator + current_msg
             result.append(text)
 
@@ -782,6 +800,61 @@ class TelegramNotifier:
                 await asyncio.sleep(0.5)  # 控制紧急通道发送速率
             except Exception as e:
                 logger.error(f"Urgent Worker Err: {e}", exc_info=True)
+
+    # --- 🐾 任务 3: Top 心跳 (主人 10-24) ---
+    # 市场安静时 (长时间无信号), 主人也希望能看到最新的 Top 排行和次数,
+    # 否则会以为系统挂了。这里每隔 TOP_HEARTBEAT_INTERVAL 秒检查一次:
+    #   - 距上次 Top 推送 (含信号触发的推送) 超过 TOP_HEARTBEAT_MIN_GAP 秒 → 主动推一次 Top
+    #   - Top 里没有任何币 → 说明今天还没有任何信号, 不推 (避免开场刷屏)
+    TOP_HEARTBEAT_INTERVAL = 60          # 检查间隔 (秒)
+    TOP_HEARTBEAT_MIN_GAP = 30 * 60      # 距上次推送的最小间隔 (30 分钟)
+    _last_top_push_ts = 0.0              # 上次推送 Top 的时间戳
+
+    async def _top_heartbeat_loop(self):
+        while self.running:
+            try:
+                await asyncio.sleep(self.TOP_HEARTBEAT_INTERVAL)
+                if not self.running:
+                    break
+
+                now = time.time()
+                # 距上次推送不足 30 分钟 → 不推
+                if self._last_top_push_ts and (
+                    now - self._last_top_push_ts < self.TOP_HEARTBEAT_MIN_GAP
+                ):
+                    continue
+
+                # 查 Top (不限数量), 没有币说明今天还没有任何信号
+                loop = asyncio.get_event_loop()
+                top_list = await loop.run_in_executor(
+                    None, self.get_today_symbols_top, 10000
+                )
+                if not top_list:
+                    continue
+
+                # 构造纯 Top 消息 (无当前信号)
+                msgs = await loop.run_in_executor(
+                    None, self._build_top_ranked_msgs, None, None, None
+                )
+                if not msgs:
+                    continue
+
+                trace = f"top_heartbeat:{int(now * 1000)}"
+                for idx, one_msg in enumerate(msgs):
+                    one_trace = trace if idx == 0 else f"{trace}#part{idx + 1}"
+                    self._enqueue_one(one_msg, one_trace)
+
+                self._last_top_push_ts = now
+                logger.info(
+                    f"📊 [Top 心跳] 市场安静, 主动推送最新 Top "
+                    f"({len(top_list)} 个币, {len(msgs)} 批)"
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Top Heartbeat Err: {e}", exc_info=True)
+                # 出错不致命, 下个周期继续
+                await asyncio.sleep(10)
 
     # --- 任务 2: 定时总结循环---
     async def _buffer_flush_loop(self):
