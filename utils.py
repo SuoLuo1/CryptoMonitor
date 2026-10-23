@@ -207,14 +207,24 @@ class TelegramNotifier:
         # Top 排名仍从 alerts.db 读取，因此调用方必须在发消息前先完成入库。
         if symbol and signal_type and price is not None:
             loop = asyncio.get_event_loop()
-            final_msg = await loop.run_in_executor(
-                None, self._build_top_ranked_msg, symbol, signal_type, msg
+            # 🐾 Top 列表可能很长 (不限数量), 拆成多条消息分批发送。
+            final_msgs = await loop.run_in_executor(
+                None, self._build_top_ranked_msgs, symbol, signal_type, msg
             )
-            msg = final_msg
+            # 每条独立入队, 独立 trace_id → 便于反查实际投递
+            for idx, one_msg in enumerate(final_msgs):
+                one_trace = trace_id if idx == 0 else (
+                    f"{trace_id}#part{idx + 1}" if trace_id else None
+                )
+                self._enqueue_one(one_msg, one_trace)
+            return True
 
+        return self._enqueue_one(msg, trace_id)
+
+    def _enqueue_one(self, msg, trace_id=None):
+        """把单条消息放进 TG 队列 (不拼接过长的消息)。"""
         logger.info(f"🔥 [send_urgent] 收到紧急消息：{msg[:50]}...")
         try:
-            # 将追踪 ID 与消息一起入队，后续即使聚合发送也能反查实际 TG message_id。
             self.queue.put_nowait({"text": msg, "trace_id": trace_id})
             logger.info(
                 f"[TG_QUEUE] trace_id={trace_id or '-'} status=accepted "
@@ -235,20 +245,21 @@ class TelegramNotifier:
             )
             return False
 
-    def _build_top_ranked_msg(self, current_symbol, current_signal_type, current_msg):
-        """
-        【新版】构建带今日 Top 排行的推送消息
+    # 🐾 Top 列表每批行数 (主人 10-22 拍板: 每批 50 行)
+    TOP_BATCH_ROWS = 50
+    # 🐾 Telegram 单条消息上限 4096, 留出余量避免被拒
+    TG_SAFE_LIMIT = 3800
 
-        格式：
-        ══════════════════════════════
-        📊 今日所有信号 Top (14:32) · 共 23 个币
-        ══════════════════════════════
-        1. CHRUSDT      8次🔥🔥🔥  🚀 +14.2%
-        2. MUBARAKUSDT  5次🔥🔥🔥  🚀 +8.5%
-        ...
-        ────── 🚀 当前信号：JOEUSDT ──────
-        🚀 暴涨 JOEUSDT (3m放量)
-        ...
+    def _build_top_ranked_msgs(self, current_symbol, current_signal_type, current_msg):
+        """
+        构建带今日 Top 排行的推送消息 (可能拆成多条)。
+
+        🐾 主人 10-22:
+          - Top 列表不再截断 (显示全部币)
+          - 每批最多 TOP_BATCH_ROWS(50) 行, 放不下就分多条发送
+          - 最后一条附上"当前信号"正文
+
+        返回: [msg1, msg2, ...]  (每个元素是一条独立的 TG 消息)
         """
         from datetime import datetime, timezone, timedelta
         BJ_TZ = timezone(timedelta(hours=8))
@@ -257,8 +268,8 @@ class TelegramNotifier:
         # 🐾 跨天日期显示需要 datetime 类 (10-04)
         _dt = datetime
 
-        # 1. 查今日所有 symbol 排行
-        top_list = self.get_today_symbols_top(limit=100)
+        # 1. 查今日所有 symbol 排行 (不限数量)
+        top_list = self.get_today_symbols_top(limit=10000)
 
         # 2. 渲染顶部
         header = (
@@ -267,14 +278,8 @@ class TelegramNotifier:
             "═══════════════════════════════\n"
         )
 
-        # 3. 渲染排行
-        # 🐾 加首次信号时间 ⏱HH:MM (区分凌晨旧信号 vs 刚冒头的新机会)
-        # 🐾 长度保护: TG 上限 4096, 加时间戳后100币必超, 按预算截断
-        MSG_BUDGET = 3800  # 给分隔符+当前信号正文留 buffer
+        # 3. 渲染排行 (每一行独立)
         lines = []
-        used_len = len(header)
-        shown = 0
-        current_line = None  # 当前信号的币, 单独保底
         for i, (sym, cnt, first_p, latest_p, first_ts) in enumerate(top_list, 1):
             # 🔥 等级：第1次无标记，第2-3次 🔥，第4+ 次 🔥🔥🔥
             if cnt >= 4:
@@ -318,33 +323,51 @@ class TelegramNotifier:
             current_mark = " ◀" if sym == current_symbol else ""
 
             line = f"{i:2d}. {sym:13s} ⏱{first_time} {cnt}次{fire:6s} {main_dir} {pct_str}{current_mark}"
+            lines.append(line)
 
-            if sym == current_symbol:
-                current_line = line  # 保底: 当前信号行不参与截断
-
-            # 长度预算控制 (预留 separator + 省略提示 ≈ 250 字符)
-            if used_len + len(line) + 1 <= MSG_BUDGET - 250 or (current_msg is None):
-                lines.append(line)
-                used_len += len(line) + 1
-                shown += 1
-            elif sym == current_symbol:
-                lines.append(line)
-                used_len += len(line) + 1
-                shown += 1
-                current_line = None  # 已入列, 不用保底
-
-        # 被截断的剩余币数
-        omitted = len(top_list) - shown
-        if omitted > 0:
-            note = f"... 还有 {omitted} 个币未显示"
-            if current_line:  # 当前信号的币被截断了, 补在最后
-                note += f"\n{current_line}"
-            lines.append(note)
-
-        # 4. 分隔 + 当前信号
+        # 4. 分批: 每批最多 TOP_BATCH_ROWS 行, 且不超过 TG 安全长度
         separator = f"\n────── {current_signal_type} 当前信号：{current_symbol} ──────\n"
+        batches = []
+        current_batch = []
+        current_len = len(header)
 
-        return header + "\n".join(lines) + separator + current_msg
+        for line in lines:
+            line_len = len(line) + 1
+            # 最后一批要额外容纳 separator + 当前信号正文
+            reserve = len(separator) + len(current_msg) if not batches else 0
+            would_exceed_rows = len(current_batch) >= self.TOP_BATCH_ROWS
+            would_exceed_len = current_len + line_len + reserve > self.TG_SAFE_LIMIT
+
+            if current_batch and (would_exceed_rows or would_exceed_len):
+                batches.append(current_batch)
+                current_batch = []
+                current_len = len(header)
+
+            current_batch.append(line)
+            current_len += line_len
+
+        if current_batch or not batches:
+            batches.append(current_batch)
+
+        # 5. 拼装最终消息列表 (最后一条附当前信号)
+        result = []
+        total_batches = len(batches)
+        for idx, batch_lines in enumerate(batches):
+            is_last = (idx == total_batches - 1)
+            batch_header = header
+            if total_batches > 1:
+                batch_header = (
+                    "═══════════════════════════════\n"
+                    f"📊 今日所有信号 Top ({now_str}) · 共 {len(top_list)} 个币 "
+                    f"(第 {idx + 1}/{total_batches} 批)\n"
+                    "═══════════════════════════════\n"
+                )
+            text = batch_header + "\n".join(batch_lines)
+            if is_last:
+                text += separator + current_msg
+            result.append(text)
+
+        return result
 
     # 🐾 12h 滑动窗口阈值: 该币沉寂超过此时长视为新冒头, 重置"首次"
     SILENT_HOURS = 12.0

@@ -126,10 +126,18 @@ class Monitors:
         allow, reason = SignalDeduplicator.arbitrate(
             signal_kind, symbol, direction, evidence
         )
-        event = SignalDeduplicator.active_events.get(symbol)
-        event_id = event.event_id if event is not None else "-"
         timestamp = float(evidence.get("timestamp", time.time()))
         trace_id = f"{symbol}:{int(timestamp * 1000)}:{signal_kind}"
+
+        # 🐾 12h 首次推送窗口 (主人 10-22):
+        #    事件层放行后再查一次"该币本窗口是否已推送过"。
+        #    已推送过 → 抑制 (只入库), 避免同一币在 12h 内反复打扰主人。
+        if allow and not SignalDeduplicator.is_first_notify(symbol, timestamp):
+            allow = False
+            reason = "symbol_already_notified"
+
+        event = SignalDeduplicator.active_events.get(symbol)
+        event_id = event.event_id if event is not None else "-"
         decision = "ALLOW" if allow else "SUPPRESS"
         print(
             f"[SIGNAL_TRACE] ts={timestamp:.3f} trace_id={trace_id} "
@@ -140,6 +148,9 @@ class Monitors:
         if not allow:
             print(f"[DEDUP] {symbol} {signal_kind} 抑制推送：{reason}")
             return False, reason
+
+        # 🐾 确认要推送 → 标记该币进入 12h 窗口
+        SignalDeduplicator.mark_notified(symbol, timestamp)
 
         push_msg = msg
         if reason == "oi_3m_confirm":
@@ -437,11 +448,22 @@ class Monitors:
                     event = SignalDeduplicator.get_event(symbol)
                     if event is None:
                         trend_trace = f"{symbol}:{int(time.time() * 1000)}:trend"
+                        # 🐾 12h 首次推送窗口 (主人 10-22):
+                        #    趋势也遵循"该币本窗口只推首次"; 已推过则只入库。
+                        if not SignalDeduplicator.is_first_notify(symbol):
+                            print(
+                                f"[SIGNAL_TRACE] trace_id={trend_trace} symbol={symbol} "
+                                f"kind=trend decision=SUPPRESS "
+                                f"reason=symbol_already_notified "
+                                f"event_id=- db={trend_db_status} price={price}"
+                            )
+                            return
                         print(
                             f"[SIGNAL_TRACE] trace_id={trend_trace} symbol={symbol} "
                             f"kind=trend decision=ALLOW reason=no_active_event "
                             f"event_id=- db={trend_db_status} price={price}"
                         )
+                        SignalDeduplicator.mark_notified(symbol)
                         await notifier.send_urgent(
                             trend_message, symbol=symbol, signal_type=trend_type,
                             price=price, save_to_db=False, trace_id=trend_trace,

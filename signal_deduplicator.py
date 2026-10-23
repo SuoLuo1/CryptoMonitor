@@ -2,6 +2,12 @@
 
 本模块只管理内存中的行情事件和 Telegram 通知配额，不操作数据库、不发送消息。
 调用方应先按原始信号限频保存原始报警，再调用 arbitrate() 判断是否推送。
+
+🐾 12h 首次推送窗口 (主人 10-22 拍板):
+  - 与 Top 排名的 12h 滑动窗口完全同一套语义
+  - 同一币在"当前 12h 窗口"内只有第一条信号会推送 Telegram
+  - 窗口内后续信号全部只入库, 不打扰主人
+  - 该币沉寂超过 12h → 视为新冒头 → 又可以推首次
 """
 import time
 import uuid
@@ -9,6 +15,10 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from config import EVENT_IDLE_CLOSE, EVENT_LINK_WINDOW, EVENT_MATERIAL_MOVE_PCT
+
+# 🐾 与 utils.TelegramNotifier.SILENT_HOURS 保持一致 (12 小时)
+#    沉寂超过此时长视为新冒头, 重置"已推送"记录
+SILENT_HOURS = 12.0
 
 
 @dataclass
@@ -41,10 +51,41 @@ class SignalDeduplicator:
 
     active_events: Dict[str, EventState] = {}
 
+    # 🐾 12h 首次推送窗口 (主人 10-22)
+    #    notified_symbols[symbol] = 该币当前 12h 窗口内首次推送的时间戳
+    #    窗口内后续信号只入库不推送; 沉寂超 12h 后过期, 允许再次推送首次
+    notified_symbols: Dict[str, float] = {}
+
     @classmethod
     def reset(cls) -> None:
         """清空内存状态，供测试和受控重启使用。"""
         cls.active_events.clear()
+        cls.notified_symbols.clear()
+
+    @classmethod
+    def _expire_notified(cls, now: float) -> None:
+        """清理沉寂超过 12h 的"已推送"记录, 让这些币可以再次推送首次。"""
+        silent = SILENT_HOURS * 3600.0
+        expired = [sym for sym, ts in cls.notified_symbols.items() if now - ts > silent]
+        for sym in expired:
+            del cls.notified_symbols[sym]
+
+    @classmethod
+    def is_first_notify(cls, symbol: str, now: Optional[float] = None) -> bool:
+        """判断该币在当前 12h 窗口内是否还没推送过。
+
+        返回 True 表示"可以推首次", False 表示"本窗口已推过, 应抑制"。
+        """
+        current_time = time.time() if now is None else now
+        cls._expire_notified(current_time)
+        return symbol not in cls.notified_symbols
+
+    @classmethod
+    def mark_notified(cls, symbol: str, now: Optional[float] = None) -> None:
+        """记录该币已推送 (进入 12h 窗口)。"""
+        current_time = time.time() if now is None else now
+        cls._expire_notified(current_time)
+        cls.notified_symbols[symbol] = current_time
 
     @classmethod
     def _expire_if_idle(cls, symbol: str, now: float) -> Optional[EventState]:
