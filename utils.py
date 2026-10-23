@@ -374,6 +374,96 @@ class TelegramNotifier:
     # 🐾 僵尸币过滤: 超过此时长无任何 urgent 信号 → 不进 Top (否则几周前的僵尸会污染排名)
     ACTIVE_HOURS = 24.0
 
+    def get_symbol_window_info(self, symbol):
+        """
+        查询单个币在"当前 12h 滑动窗口"内的信号统计。
+
+        🐾 这是 12h 窗口算法的单一事实源, 与 get_today_symbols_top() 完全同一套语义:
+          - 从该币最后一条往前回溯, 遇到第一个相邻间隔 >12h 的位置就停
+          - 那个位置之后的"连续段"就是当前 12h 窗口
+          - 沉寂 > ACTIVE_HOURS(24h) 的币视为僵尸, 不在窗口内 (返回 None)
+
+        返回 dict 或 None:
+          {
+            'symbol': str,
+            'count': int,          # 当前窗口内的信号条数
+            'window_start': str,   # 窗口起点时间 (北京时间字符串)
+            'last_ts': str,        # 该币最后一条信号时间
+            'last_price': float,   # 该币最后一条信号的价格
+          }
+        """
+        import sqlite3
+        from datetime import datetime as _dt
+
+        try:
+            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT timestamp, price_at_alert
+                FROM alerts
+                WHERE priority = 'urgent'
+                  AND symbol = ?
+                  AND price_at_alert IS NOT NULL
+                ORDER BY timestamp ASC
+                """,
+                (symbol,),
+            )
+            recs = cursor.fetchall()
+            conn.close()
+
+            if not recs:
+                return None
+
+            parsed = [(_dt.fromisoformat(ts), price) for ts, price in recs]
+            last_ts, last_price = parsed[-1]
+
+            SILENT = self.SILENT_HOURS * 3600.0
+            ACTIVE = self.ACTIVE_HOURS * 3600.0
+            now_epoch = _dt.now().timestamp()
+
+            # 僵尸币: 最后一次信号距今 > 24h → 不在窗口内
+            last_epoch = last_ts.timestamp()
+            if now_epoch - last_epoch > ACTIVE:
+                return None
+
+            # 从末条往前回溯, 找第一个相邻间隔 >12h 的位置
+            win_start_idx = len(parsed) - 1
+            for i in range(len(parsed) - 2, -1, -1):
+                diff = (parsed[i + 1][0] - parsed[i][0]).total_seconds()
+                if diff > SILENT:
+                    win_start_idx = i + 1
+                    break
+
+            win_start_ts = parsed[win_start_idx][0]
+            count = len(parsed) - win_start_idx
+
+            return {
+                'symbol': symbol,
+                'count': count,
+                'window_start': win_start_ts.strftime('%Y-%m-%d %H:%M:%S'),
+                'last_ts': last_ts.strftime('%Y-%m-%d %H:%M:%S'),
+                'last_price': last_price,
+            }
+        except Exception as e:
+            logger.error(f"❌ [get_symbol_window_info] 查询失败：{e}", exc_info=True)
+            return None
+
+    def is_symbol_first_notify(self, symbol):
+        """
+        判断该币在"当前 12h 窗口"内是否还没有过信号记录。
+
+        🐾 与 Top 排名完全同一套 12h 窗口算法 (get_symbol_window_info):
+          - count >= 1 → 该币本窗口已有信号 → 不是首次
+          - count == 0 或查不到 → 是首次 (该币是新冒头的)
+
+        这样重启后行为跟不重启完全一致: Top 上的币不会因为重启而重新推一遍。
+        """
+        info = self.get_symbol_window_info(symbol)
+        if info is None:
+            return True
+        return info['count'] < 1
+
     def get_today_symbols_top(self, limit=100):
         """
         查询所有 (symbol) 聚合排行 —— 【12h 滑动窗口版】

@@ -23,36 +23,9 @@ class SignalDeduplicatorTests(unittest.TestCase):
         self.assertEqual(reason, "same_direction_event")
 
     # ── 🐾 12h 首次推送窗口 (主人 10-22) ──
-    def test_symbol_only_notified_once_within_12h_window(self):
-        # 首次: 该币本窗口还没推过 → 允许
-        self.assertTrue(SignalDeduplicator.is_first_notify("ABCUSDT", now=1000))
-
-        # 标记已推送
-        SignalDeduplicator.mark_notified("ABCUSDT", now=1000)
-
-        # 窗口内 (12h 内) 再来 → 不允许
-        self.assertFalse(SignalDeduplicator.is_first_notify("ABCUSDT", now=1000 + 3600))
-        self.assertFalse(SignalDeduplicator.is_first_notify("ABCUSDT", now=1000 + 11 * 3600))
-
-    def test_symbol_can_notify_again_after_12h_silence(self):
-        SignalDeduplicator.mark_notified("ABCUSDT", now=1000)
-
-        # 沉寂超过 12h → 视为新冒头 → 再次允许推送首次
-        self.assertTrue(
-            SignalDeduplicator.is_first_notify("ABCUSDT", now=1000 + 12 * 3600 + 1)
-        )
-
-    def test_notified_symbols_are_independent(self):
-        SignalDeduplicator.mark_notified("ABCUSDT", now=1000)
-
-        # 不同币不受影响
-        self.assertTrue(SignalDeduplicator.is_first_notify("XYZUSDT", now=1000))
-        self.assertFalse(SignalDeduplicator.is_first_notify("ABCUSDT", now=1000))
-
-    def test_reset_clears_notified_symbols(self):
-        SignalDeduplicator.mark_notified("ABCUSDT", now=1000)
-        SignalDeduplicator.reset()
-        self.assertTrue(SignalDeduplicator.is_first_notify("ABCUSDT", now=1000))
+    #    该窗口的判断已移到 utils.TelegramNotifier.is_symbol_first_notify()
+    #    (复用 Top 排名的 12h 算法, 查 alerts.db), 因此重启后行为一致。
+    #    纯状态机测试不涉及 DB, 这里只保留事件级去重的原有覆盖。
 
     def test_repeated_same_direction_signals_keep_one_event_alive(self):
         # 价格每次变化都不到 1%，但持续出现的同方向异动应属于同一事件。
