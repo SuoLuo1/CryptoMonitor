@@ -20,6 +20,10 @@ import matplotlib
 from concurrent.futures import ThreadPoolExecutor
 from config import TG_BOT_TOKEN, TG_CHAT_ID, BINANCE_HTTP_FUTURES
 from llm_agent import DeepSeekAgent
+from signal_window import (
+    is_first_signal_after_silence,
+    should_ignore_stale_signal_during_startup,
+)
 
 matplotlib.use('Agg')
 
@@ -156,6 +160,8 @@ class TelegramNotifier:
 
         self.running = False
         self.session = None
+        # 记录本次进程启动时间；启动暖机期只保护陈旧历史触发，不改变正常 12h 分段规则。
+        self._started_monotonic = None
 
         # 实例化 AI
         self.llm = DeepSeekAgent()
@@ -164,7 +170,18 @@ class TelegramNotifier:
 
         self.chart_executor = ThreadPoolExecutor(max_workers=2)
 
+    # 启动暖机期覆盖趋势逻辑所需的前 10 根 1m K 线，并留少量缓冲时间。
+    STARTUP_WARMUP_SECONDS = 15 * 60
+
+    @property
+    def startup_age_seconds(self):
+        """返回本进程启动后的秒数；未启动时返回 None。"""
+        if self._started_monotonic is None:
+            return None
+        return max(0.0, time.monotonic() - self._started_monotonic)
+
     async def start(self):
+        self._started_monotonic = time.monotonic()
         self.running = True
         connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
         timeout = aiohttp.ClientTimeout(total=10)
@@ -186,11 +203,21 @@ class TelegramNotifier:
 
     # --- 方法 A: 紧急消息发送 ---
     async def save_to_db_now(
-        self, symbol, signal_type, msg, price=None, priority="urgent"
+        self, symbol, signal_type, msg, price=None, priority="urgent",
+        *, check_first_window=False, startup_age_seconds=None
     ):
-        """只保存原始信号，不发送 Telegram；供事件层抑制消息后保留历史记录。"""
+        """
+        只保存原始信号，不发送 Telegram。
+
+        check_first_window=True 时，会在同一 SQLite 写事务中判断当前信号是否为
+        12h 连续段首条，再插入当前记录。默认返回值仍是原三元组；启用后追加：
+        第四项 is_first_window、第五项 new_id、第六项是否因启动期陈旧历史而忽略窗口。
+        """
         return await self._save_alert_to_db(
-            msg, priority=priority, symbol=symbol, signal_type=signal_type, price=price
+            msg, priority=priority, symbol=symbol, signal_type=signal_type,
+            price=price,
+            check_first_window=check_first_window,
+            startup_age_seconds=startup_age_seconds,
         )
 
     async def send_urgent(
@@ -467,20 +494,95 @@ class TelegramNotifier:
             logger.error(f"❌ [get_symbol_window_info] 查询失败：{e}", exc_info=True)
             return None
 
-    def is_symbol_first_notify(self, symbol):
+    def is_symbol_first_notify(self, symbol, current_timestamp=None, exclude_id=None):
         """
-        判断该币在"当前 12h 窗口"内是否还没有过信号记录。
+        判断该币在"当前 12h 分段"内是否还没有过信号记录。
 
-        🐾 与 Top 排名完全同一套 12h 窗口算法 (get_symbol_window_info):
-          - count >= 1 → 该币本窗口已有信号 → 不是首次
-          - count == 0 或查不到 → 是首次 (该币是新冒头的)
+        🐾 gap-based 语义 (与 signal_window.is_first_signal_after_silence 一致):
+          - 该币没有历史信号 → 是首次
+          - 与上一条信号的间隔严格大于 SILENT_HOURS → 是首次 (新段首条)
+          - 间隔在 SILENT_HOURS 以内 → 不是首次 (本段已推过)
 
-        这样重启后行为跟不重启完全一致: Top 上的币不会因为重启而重新推一遍。
+        🐾 为什么不用 count-based:
+          count-based 判据是"窗口内有多少条记录"，而每条信号都会入库，
+          count 恒 >= 1 → 永远判定为"非首次" → 永久静默。
+          gap-based 比较的是"本次 vs 上一条"的时间间隔, 才是真正的首次语义。
+
+        🐾 启动期陈旧信号:
+          启动暖机期内，距上一条有效记录超过 24h 的触发会保留在 Top，
+          但通过 notify_window_ignored 标记不推进通知窗口；暖机结束后恢复纯 12h 规则。
+
+        🐾 exclude_id (优先):
+          本次信号已入库时, 用它的主键精确排除自己。
+          同一秒可能有多条信号, 此时靠 timestamp 比较会误伤真正的上一条
+          (SQLite 里 timestamp 是字符串比较), 所以优先用 id 排除。
+
+        🐾 current_timestamp (兜底):
+          没有 exclude_id 时, 退化成"取时间戳早于本次信号的最近一条"。
         """
-        info = self.get_symbol_window_info(symbol)
-        if info is None:
-            return True
-        return info['count'] < 1
+        import sqlite3
+        from datetime import datetime as _dt, timezone, timedelta
+
+        try:
+            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+            cursor = conn.cursor()
+            if exclude_id is not None:
+                cursor.execute(
+                    """
+                    SELECT timestamp FROM alerts
+                    WHERE priority = 'urgent'
+                      AND symbol = ?
+                      AND price_at_alert IS NOT NULL
+                      AND COALESCE(notify_window_ignored, 0) = 0
+                      AND id != ?
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (symbol, exclude_id),
+                )
+            elif current_timestamp:
+                cursor.execute(
+                    """
+                    SELECT timestamp FROM alerts
+                    WHERE priority = 'urgent'
+                      AND symbol = ?
+                      AND price_at_alert IS NOT NULL
+                      AND COALESCE(notify_window_ignored, 0) = 0
+                      AND timestamp < ?
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (symbol, current_timestamp),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT timestamp FROM alerts
+                    WHERE priority = 'urgent'
+                      AND symbol = ?
+                      AND price_at_alert IS NOT NULL
+                      AND COALESCE(notify_window_ignored, 0) = 0
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                )
+            previous = cursor.fetchone()
+            conn.close()
+
+            now_str = current_timestamp or datetime.now(
+                timezone(timedelta(hours=8))
+            ).strftime("%Y-%m-%d %H:%M:%S")
+
+            return is_first_signal_after_silence(
+                previous[0] if previous else None,
+                now_str,
+                silent_hours=self.SILENT_HOURS,
+            )
+        except Exception as e:
+            # 🐾 降级策略: 查询失败时保守抑制, 避免退回旧的 count-based 造成永久静默
+            logger.error(f"❌ [is_symbol_first_notify] 查询失败：{e}", exc_info=True)
+            return False
 
     def get_today_symbols_top(self, limit=100):
         """
@@ -583,7 +685,8 @@ class TelegramNotifier:
     # --- 方法 B: 缓冲发送 (进篮子) ---
 
     async def _save_alert_to_db(
-        self, msg, priority="buffered", *, symbol=None, signal_type=None, price=None
+        self, msg, priority="buffered", *, symbol=None, signal_type=None,
+        price=None, check_first_window=False, startup_age_seconds=None
     ):
         """保存原始警报。允许调用方传入显式字段，避免通过消息文本猜测 OI 类型。"""
         import sqlite3
@@ -631,26 +734,96 @@ class TelegramNotifier:
             beijing_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
             def _db_insert():
-                conn = sqlite3.connect("/root/CryptoMonitor/alerts.db")
+                conn = sqlite3.connect("/root/CryptoMonitor/alerts.db", timeout=30)
                 try:
                     cursor = conn.cursor()
+                    is_first_window = None
+                    ignore_for_window = False
+
+                    # SQLite 本身也只允许一个写事务；提前获取写锁，避免并发时重复迁移列。
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor.execute("PRAGMA table_info(alerts)")
+                    columns = {row[1] for row in cursor.fetchall()}
+                    if "notify_window_ignored" not in columns:
+                        cursor.execute(
+                            "ALTER TABLE alerts ADD COLUMN "
+                            "notify_window_ignored INTEGER NOT NULL DEFAULT 0"
+                        )
+
+                    if check_first_window and priority == "urgent":
+                        # 先查询上一条会影响通知窗口的有效价格信号。
+                        # 启动期忽略记录仍留在 Top，但不推进通知窗口。
+                        cursor.execute(
+                            """
+                            SELECT timestamp
+                            FROM alerts
+                            WHERE priority = 'urgent'
+                              AND symbol = ?
+                              AND price_at_alert IS NOT NULL
+                              AND COALESCE(notify_window_ignored, 0) = 0
+                            ORDER BY timestamp DESC, id DESC
+                            LIMIT 1
+                            """,
+                            (symbol,),
+                        )
+                        previous = cursor.fetchone()
+                        previous_ts = previous[0] if previous else None
+
+                        # 只在进程启动暖机期抑制 24h 以上的陈旧历史触发。
+                        # 正常运行期不应用 active_hours，真实新信号仍按 >12h 开新段。
+                        ignore_for_window = should_ignore_stale_signal_during_startup(
+                            previous_ts,
+                            beijing_time,
+                            startup_age_seconds,
+                            startup_grace_seconds=self.STARTUP_WARMUP_SECONDS,
+                            active_hours=self.ACTIVE_HOURS,
+                        )
+                        is_first_window = (
+                            False
+                            if ignore_for_window
+                            else is_first_signal_after_silence(
+                                previous_ts,
+                                beijing_time,
+                                silent_hours=self.SILENT_HOURS,
+                            )
+                        )
+
+                    # 原始信号始终保存，Top 排名仍读取全部 urgent 记录，包括启动期忽略记录。
                     cursor.execute(
                         """
-                        INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority, timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO alerts (
+                            symbol, signal_type, message, price_at_alert, priority,
+                            timestamp, notify_window_ignored
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (symbol, signal_type, msg, price, priority, beijing_time),
+                        (
+                            symbol, signal_type, msg, price, priority, beijing_time,
+                            1 if ignore_for_window else 0,
+                        ),
                     )
+                    new_id = cursor.lastrowid
                     conn.commit()
+                    return is_first_window, new_id, ignore_for_window
                 finally:
                     conn.close()
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _db_insert)
-            print(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
+            is_first_window, new_id, ignore_for_window = await loop.run_in_executor(
+                None, _db_insert
+            )
+            logger.info(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
+            if check_first_window:
+                # 第 5 项为本次记录主键；第 6 项标明是否因启动期陈旧历史而忽略通知窗口。
+                return (
+                    symbol, signal_type, price, bool(is_first_window), new_id,
+                    bool(ignore_for_window),
+                )
             return symbol, signal_type, price
         except Exception as e:
-            print(f"[❌DB] 保存警报失败：{e}")
+            logger.error(f"[❌DB] 保存警报失败：{e}")
+            if check_first_window:
+                return None, None, None, False, None, False
             return None, None, None
 
     def get_today_signal_stats(self, symbol, signal_type):
