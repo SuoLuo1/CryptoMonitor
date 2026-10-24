@@ -508,8 +508,9 @@ class TelegramNotifier:
           count 恒 >= 1 → 永远判定为"非首次" → 永久静默。
           gap-based 比较的是"本次 vs 上一条"的时间间隔, 才是真正的首次语义。
 
-        🐾 active_hours 僵尸门槛:
-          沉寂超过 ACTIVE_HOURS(24h) 的币视为僵尸, 不推送, 与 Top 排名口径一致。
+        🐾 启动期陈旧信号:
+          启动暖机期内，距上一条有效记录超过 24h 的触发会保留在 Top，
+          但通过 notify_window_ignored 标记不推进通知窗口；暖机结束后恢复纯 12h 规则。
 
         🐾 exclude_id (优先):
           本次信号已入库时, 用它的主键精确排除自己。
@@ -804,7 +805,7 @@ class TelegramNotifier:
                     )
                     new_id = cursor.lastrowid
                     conn.commit()
-                    return is_first_window, new_id
+                    return is_first_window, new_id, ignore_for_window
                 finally:
                     conn.close()
 
@@ -812,13 +813,16 @@ class TelegramNotifier:
             is_first_window, new_id = await loop.run_in_executor(None, _db_insert)
             logger.info(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
             if check_first_window:
-                # 🐾 追加第 5 项: 新记录主键, 供降级路径精确排除"自己"
-                return symbol, signal_type, price, bool(is_first_window), new_id
+                # 第 5 项为本次记录主键；第 6 项标明是否因启动期陈旧历史而忽略通知窗口。
+                return (
+                    symbol, signal_type, price, bool(is_first_window), new_id,
+                    bool(ignore_for_window),
+                )
             return symbol, signal_type, price
         except Exception as e:
             logger.error(f"[❌DB] 保存警报失败：{e}")
             if check_first_window:
-                return None, None, None, False, None
+                return None, None, None, False, None, False
             return None, None, None
 
     def get_today_signal_stats(self, symbol, signal_type):
