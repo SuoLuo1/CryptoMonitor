@@ -57,6 +57,17 @@ class SignalWindowTests(unittest.TestCase):
             )
         )
 
+    def test_exactly_24_hour_gap_is_not_treated_as_stale(self):
+        self.assertFalse(
+            should_ignore_stale_signal_during_startup(
+                "2026-10-23 13:00:00",
+                "2026-10-24 13:00:00",
+                startup_age_seconds=60,
+                startup_grace_seconds=900,
+                active_hours=24,
+            )
+        )
+
     def test_old_record_does_not_block_a_signal_after_startup_warmup(self):
         self.assertFalse(
             should_ignore_stale_signal_during_startup(
