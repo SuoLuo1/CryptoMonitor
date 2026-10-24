@@ -578,7 +578,6 @@ class TelegramNotifier:
                 previous[0] if previous else None,
                 now_str,
                 silent_hours=self.SILENT_HOURS,
-                active_hours=self.ACTIVE_HOURS,
             )
         except Exception as e:
             # 🐾 降级策略: 查询失败时保守抑制, 避免退回旧的 count-based 造成永久静默
@@ -810,7 +809,9 @@ class TelegramNotifier:
                     conn.close()
 
             loop = asyncio.get_event_loop()
-            is_first_window, new_id = await loop.run_in_executor(None, _db_insert)
+            is_first_window, new_id, ignore_for_window = await loop.run_in_executor(
+                None, _db_insert
+            )
             logger.info(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
             if check_first_window:
                 # 第 5 项为本次记录主键；第 6 项标明是否因启动期陈旧历史而忽略通知窗口。
