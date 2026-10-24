@@ -20,6 +20,7 @@ import matplotlib
 from concurrent.futures import ThreadPoolExecutor
 from config import TG_BOT_TOKEN, TG_CHAT_ID, BINANCE_HTTP_FUTURES
 from llm_agent import DeepSeekAgent
+from signal_window import is_first_signal_after_silence
 
 matplotlib.use('Agg')
 
@@ -186,11 +187,19 @@ class TelegramNotifier:
 
     # --- 方法 A: 紧急消息发送 ---
     async def save_to_db_now(
-        self, symbol, signal_type, msg, price=None, priority="urgent"
+        self, symbol, signal_type, msg, price=None, priority="urgent",
+        *, check_first_window=False
     ):
-        """只保存原始信号，不发送 Telegram；供事件层抑制消息后保留历史记录。"""
+        """
+        只保存原始信号，不发送 Telegram。
+
+        check_first_window=True 时，会在同一 SQLite 写事务中判断当前信号是否为
+        12h 连续段首条，再插入当前记录。默认返回值仍是原三元组；启用后追加
+        第四项 is_first_window，避免旧调用方受到影响。
+        """
         return await self._save_alert_to_db(
-            msg, priority=priority, symbol=symbol, signal_type=signal_type, price=price
+            msg, priority=priority, symbol=symbol, signal_type=signal_type,
+            price=price, check_first_window=check_first_window
         )
 
     async def send_urgent(
@@ -583,7 +592,8 @@ class TelegramNotifier:
     # --- 方法 B: 缓冲发送 (进篮子) ---
 
     async def _save_alert_to_db(
-        self, msg, priority="buffered", *, symbol=None, signal_type=None, price=None
+        self, msg, priority="buffered", *, symbol=None, signal_type=None,
+        price=None, check_first_window=False
     ):
         """保存原始警报。允许调用方传入显式字段，避免通过消息文本猜测 OI 类型。"""
         import sqlite3
@@ -631,9 +641,35 @@ class TelegramNotifier:
             beijing_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
             def _db_insert():
-                conn = sqlite3.connect("/root/CryptoMonitor/alerts.db")
+                conn = sqlite3.connect("/root/CryptoMonitor/alerts.db", timeout=30)
                 try:
                     cursor = conn.cursor()
+                    is_first_window = None
+
+                    if check_first_window and priority == "urgent":
+                        # 先锁定写事务，再查询上一条有效价格信号。
+                        # 因此并发到达的同币信号也只有第一条能看到 >12h 的间隔。
+                        conn.execute("BEGIN IMMEDIATE")
+                        cursor.execute(
+                            """
+                            SELECT timestamp
+                            FROM alerts
+                            WHERE priority = 'urgent'
+                              AND symbol = ?
+                              AND price_at_alert IS NOT NULL
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                            """,
+                            (symbol,),
+                        )
+                        previous = cursor.fetchone()
+                        is_first_window = is_first_signal_after_silence(
+                            previous[0] if previous else None,
+                            beijing_time,
+                            silent_hours=self.SILENT_HOURS,
+                        )
+
+                    # 无论后续是否推送，原始信号都入库，Top 统计口径不变。
                     cursor.execute(
                         """
                         INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority, timestamp)
@@ -642,15 +678,20 @@ class TelegramNotifier:
                         (symbol, signal_type, msg, price, priority, beijing_time),
                     )
                     conn.commit()
+                    return is_first_window
                 finally:
                     conn.close()
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _db_insert)
+            is_first_window = await loop.run_in_executor(None, _db_insert)
             print(f"[📝DB] 保存警报：{symbol} {signal_type} [{priority}]")
+            if check_first_window:
+                return symbol, signal_type, price, bool(is_first_window)
             return symbol, signal_type, price
         except Exception as e:
             print(f"[❌DB] 保存警报失败：{e}")
+            if check_first_window:
+                return None, None, None, False
             return None, None, None
 
     def get_today_signal_stats(self, symbol, signal_type):
