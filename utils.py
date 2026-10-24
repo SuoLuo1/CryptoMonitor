@@ -740,20 +740,19 @@ class TelegramNotifier:
                     is_first_window = None
                     ignore_for_window = False
 
+                    # SQLite 本身也只允许一个写事务；提前获取写锁，避免并发时重复迁移列。
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor.execute("PRAGMA table_info(alerts)")
+                    columns = {row[1] for row in cursor.fetchall()}
+                    if "notify_window_ignored" not in columns:
+                        cursor.execute(
+                            "ALTER TABLE alerts ADD COLUMN "
+                            "notify_window_ignored INTEGER NOT NULL DEFAULT 0"
+                        )
+
                     if check_first_window and priority == "urgent":
-                        # 先锁定写事务，再查询上一条会影响通知窗口的有效价格信号。
-                        conn.execute("BEGIN IMMEDIATE")
-
-                        # 兼容现有 alerts.db：启动期忽略记录仍保留在 Top 中，
-                        # 但不应推进通知窗口，因此用独立标记而不是改 priority。
-                        cursor.execute("PRAGMA table_info(alerts)")
-                        columns = {row[1] for row in cursor.fetchall()}
-                        if "notify_window_ignored" not in columns:
-                            cursor.execute(
-                                "ALTER TABLE alerts ADD COLUMN "
-                                "notify_window_ignored INTEGER NOT NULL DEFAULT 0"
-                            )
-
+                        # 先查询上一条会影响通知窗口的有效价格信号。
+                        # 启动期忽略记录仍留在 Top，但不推进通知窗口。
                         cursor.execute(
                             """
                             SELECT timestamp
