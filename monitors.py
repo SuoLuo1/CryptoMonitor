@@ -128,6 +128,7 @@ class Monitors:
         db_result = await notifier.save_to_db_now(
             symbol, signal_type, msg, price, priority="urgent",
             check_first_window=True,
+            startup_age_seconds=notifier.startup_age_seconds,
         )
         db_status = "ok" if db_result and db_result[0] else "failed"
         if db_status == "ok" and len(db_result) > 3:
@@ -455,6 +456,7 @@ class Monitors:
                     trend_db_result = await notifier.save_to_db_now(
                         symbol, trend_type, trend_message, price, priority="urgent",
                         check_first_window=True,
+                        startup_age_seconds=notifier.startup_age_seconds,
                     )
                     trend_db_status = "ok" if trend_db_result and trend_db_result[0] else "failed"
                     if trend_db_status == "ok" and len(trend_db_result) > 3:
