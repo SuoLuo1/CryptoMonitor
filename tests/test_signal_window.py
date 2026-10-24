@@ -1,8 +1,6 @@
 """12h 首次信号分段边界测试。"""
 
 import unittest
-from datetime import datetime, timedelta
-
 from signal_window import is_first_signal_after_silence
 
 
