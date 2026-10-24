@@ -1,11 +1,15 @@
 # monitors.py
 import asyncio
+import logging
 import time
 from collections import deque
 
 from config import *
 from utils import notifier
 from signal_deduplicator import SignalDeduplicator
+
+# 🐾 信号决策链路用 logger (主人偏好), 这样 journal 和 logs/cryptomonitor.log 都能查到
+logger = logging.getLogger("Monitors")
 
 
 class Monitors:
@@ -48,7 +52,7 @@ class Monitors:
     def update_valid_symbols(cls, all_symbols, vip_subset):
         cls.valid_symbols = set(s.upper() for s in all_symbols)
         cls.vip_symbols = set(s.upper() for s in vip_subset)
-        print(f"🛡️ 监控名单: {len(cls.valid_symbols)} 个 | 🧠 AI名单: {len(cls.vip_symbols)} 个")
+        logger.info(f"🛡️ 监控名单: {len(cls.valid_symbols)} 个 | 🧠 AI名单: {len(cls.vip_symbols)} 个")
     @classmethod
     def _check_cooldown(cls, key, cooldown_seconds=300):
         """
@@ -129,8 +133,11 @@ class Monitors:
         if db_status == "ok" and len(db_result) > 3:
             first_in_window = bool(db_result[3])
         else:
-            # 数据库写入异常时沿用旧查询作为降级路径。
-            first_in_window = notifier.is_symbol_first_notify(symbol)
+            # 数据库写入异常时的降级路径: 用本次记录主键精确排除"自己"。
+            # 🐾 不用旧的 count-based 判定: 那套逻辑 count 恒 >= 1 → 永久静默。
+            first_in_window = notifier.is_symbol_first_notify(
+                symbol, exclude_id=db_result[4] if db_result and len(db_result) > 4 else None
+            )
 
         allow, reason = SignalDeduplicator.arbitrate(
             signal_kind, symbol, direction, evidence
@@ -146,14 +153,14 @@ class Monitors:
         event = SignalDeduplicator.active_events.get(symbol)
         event_id = event.event_id if event is not None else "-"
         decision = "ALLOW" if allow else "SUPPRESS"
-        print(
+        logger.info(
             f"[SIGNAL_TRACE] ts={timestamp:.3f} trace_id={trace_id} "
             f"event_id={event_id} symbol={symbol} kind={signal_kind} "
             f"direction={direction:+d} decision={decision} reason={reason} "
             f"db={db_status} price={price}"
         )
         if not allow:
-            print(f"[DEDUP] {symbol} {signal_kind} 抑制推送：{reason}")
+            logger.info(f"[DEDUP] {symbol} {signal_kind} 抑制推送：{reason}")
             return False, reason
 
         push_msg = msg
@@ -321,7 +328,7 @@ class Monitors:
                         )
 
         except Exception as e:
-            print(f"[DEPTH ERROR] {symbol}: {e}")
+            logger.error(f"[DEPTH ERROR] {symbol}: {e}")
 
     # ---------------------------------------------------------
     # 2. K线数据处理
@@ -404,7 +411,7 @@ class Monitors:
                     trace_id = f"{symbol}:{int(timestamp * 1000)}:initial_1m"
                     event = SignalDeduplicator.active_events.get(symbol)
                     event_id = event.event_id if event is not None else "-"
-                    print(
+                    logger.info(
                         f"[SIGNAL_TRACE] ts={timestamp:.3f} trace_id={trace_id} "
                         f"event_id={event_id} symbol={symbol} kind=initial_1m "
                         f"direction={direction:+d} decision=SUPPRESS "
@@ -453,20 +460,28 @@ class Monitors:
                     if trend_db_status == "ok" and len(trend_db_result) > 3:
                         trend_first_in_window = bool(trend_db_result[3])
                     else:
-                        trend_first_in_window = notifier.is_symbol_first_notify(symbol)
+                        # 同上: 降级路径用主键精确排除"自己", 避免 count-based 永久静默
+                        trend_first_in_window = notifier.is_symbol_first_notify(
+                            symbol,
+                            exclude_id=(
+                                trend_db_result[4]
+                                if trend_db_result and len(trend_db_result) > 4
+                                else None
+                            ),
+                        )
                     event = SignalDeduplicator.get_event(symbol)
                     if event is None:
                         trend_trace = f"{symbol}:{int(time.time() * 1000)}:trend"
                         # 趋势信号使用与 Top 相同的 12h 分段边界；所有信号仍然入库。
                         if not trend_first_in_window:
-                            print(
+                            logger.info(
                                 f"[SIGNAL_TRACE] trace_id={trend_trace} symbol={symbol} "
                                 f"kind=trend decision=SUPPRESS "
                                 f"reason=symbol_already_notified "
                                 f"event_id=- db={trend_db_status} price={price}"
                             )
                             return
-                        print(
+                        logger.info(
                             f"[SIGNAL_TRACE] trace_id={trend_trace} symbol={symbol} "
                             f"kind=trend decision=ALLOW reason=no_active_event "
                             f"event_id=- db={trend_db_status} price={price}"
@@ -483,13 +498,13 @@ class Monitors:
                         )
                     elif event.direction == trend_direction:
                         SignalDeduplicator.touch_event(symbol)
-                        print(
+                        logger.info(
                             f"[SIGNAL_TRACE] symbol={symbol} kind=trend "
                             f"decision=SUPPRESS reason=attached_to_event "
                             f"event_id={event.event_id} db={trend_db_status} price={price}"
                         )
                     else:
-                        print(
+                        logger.info(
                             f"[SIGNAL_TRACE] symbol={symbol} kind=trend "
                             f"decision=SUPPRESS reason=opposite_active_event "
                             f"event_id={event.event_id} db={trend_db_status} price={price}"
@@ -770,5 +785,5 @@ class Monitors:
                                 f"信号: 大户抛售现货，合约多头即将踩踏"
                             )
             except Exception as e:
-                print(f"Error processing {symbol}: {e}")
+                logger.error(f"Error processing {symbol}: {e}")
                 continue
