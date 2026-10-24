@@ -20,7 +20,10 @@ import matplotlib
 from concurrent.futures import ThreadPoolExecutor
 from config import TG_BOT_TOKEN, TG_CHAT_ID, BINANCE_HTTP_FUTURES
 from llm_agent import DeepSeekAgent
-from signal_window import is_first_signal_after_silence
+from signal_window import (
+    is_first_signal_after_silence,
+    should_ignore_stale_signal_during_startup,
+)
 
 matplotlib.use('Agg')
 
@@ -157,6 +160,8 @@ class TelegramNotifier:
 
         self.running = False
         self.session = None
+        # 记录本次进程启动时间；启动暖机期只保护陈旧历史触发，不改变正常 12h 分段规则。
+        self._started_monotonic = None
 
         # 实例化 AI
         self.llm = DeepSeekAgent()
@@ -165,7 +170,18 @@ class TelegramNotifier:
 
         self.chart_executor = ThreadPoolExecutor(max_workers=2)
 
+    # 启动暖机期覆盖趋势逻辑所需的前 10 根 1m K 线，并留少量缓冲时间。
+    STARTUP_WARMUP_SECONDS = 15 * 60
+
+    @property
+    def startup_age_seconds(self):
+        """返回本进程启动后的秒数；未启动时返回 None。"""
+        if self._started_monotonic is None:
+            return None
+        return max(0.0, time.monotonic() - self._started_monotonic)
+
     async def start(self):
+        self._started_monotonic = time.monotonic()
         self.running = True
         connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
         timeout = aiohttp.ClientTimeout(total=10)
@@ -188,7 +204,7 @@ class TelegramNotifier:
     # --- 方法 A: 紧急消息发送 ---
     async def save_to_db_now(
         self, symbol, signal_type, msg, price=None, priority="urgent",
-        *, check_first_window=False
+        *, check_first_window=False, startup_age_seconds=None
     ):
         """
         只保存原始信号，不发送 Telegram。
@@ -199,7 +215,9 @@ class TelegramNotifier:
         """
         return await self._save_alert_to_db(
             msg, priority=priority, symbol=symbol, signal_type=signal_type,
-            price=price, check_first_window=check_first_window
+            price=price,
+            check_first_window=check_first_window,
+            startup_age_seconds=startup_age_seconds,
         )
 
     async def send_urgent(
@@ -514,6 +532,7 @@ class TelegramNotifier:
                     WHERE priority = 'urgent'
                       AND symbol = ?
                       AND price_at_alert IS NOT NULL
+                      AND COALESCE(notify_window_ignored, 0) = 0
                       AND id != ?
                     ORDER BY timestamp DESC, id DESC
                     LIMIT 1
@@ -527,6 +546,7 @@ class TelegramNotifier:
                     WHERE priority = 'urgent'
                       AND symbol = ?
                       AND price_at_alert IS NOT NULL
+                      AND COALESCE(notify_window_ignored, 0) = 0
                       AND timestamp < ?
                     ORDER BY timestamp DESC, id DESC
                     LIMIT 1
@@ -540,6 +560,7 @@ class TelegramNotifier:
                     WHERE priority = 'urgent'
                       AND symbol = ?
                       AND price_at_alert IS NOT NULL
+                      AND COALESCE(notify_window_ignored, 0) = 0
                     ORDER BY timestamp DESC, id DESC
                     LIMIT 1
                     """,
@@ -665,7 +686,7 @@ class TelegramNotifier:
 
     async def _save_alert_to_db(
         self, msg, priority="buffered", *, symbol=None, signal_type=None,
-        price=None, check_first_window=False
+        price=None, check_first_window=False, startup_age_seconds=None
     ):
         """保存原始警报。允许调用方传入显式字段，避免通过消息文本猜测 OI 类型。"""
         import sqlite3
@@ -717,11 +738,22 @@ class TelegramNotifier:
                 try:
                     cursor = conn.cursor()
                     is_first_window = None
+                    ignore_for_window = False
 
                     if check_first_window and priority == "urgent":
-                        # 先锁定写事务，再查询上一条有效价格信号。
-                        # 因此并发到达的同币信号也只有第一条能看到 >12h 的间隔。
+                        # 先锁定写事务，再查询上一条会影响通知窗口的有效价格信号。
                         conn.execute("BEGIN IMMEDIATE")
+
+                        # 兼容现有 alerts.db：启动期忽略记录仍保留在 Top 中，
+                        # 但不应推进通知窗口，因此用独立标记而不是改 priority。
+                        cursor.execute("PRAGMA table_info(alerts)")
+                        columns = {row[1] for row in cursor.fetchall()}
+                        if "notify_window_ignored" not in columns:
+                            cursor.execute(
+                                "ALTER TABLE alerts ADD COLUMN "
+                                "notify_window_ignored INTEGER NOT NULL DEFAULT 0"
+                            )
+
                         cursor.execute(
                             """
                             SELECT timestamp
@@ -729,26 +761,47 @@ class TelegramNotifier:
                             WHERE priority = 'urgent'
                               AND symbol = ?
                               AND price_at_alert IS NOT NULL
-                            ORDER BY timestamp DESC
+                              AND COALESCE(notify_window_ignored, 0) = 0
+                            ORDER BY timestamp DESC, id DESC
                             LIMIT 1
                             """,
                             (symbol,),
                         )
                         previous = cursor.fetchone()
-                        is_first_window = is_first_signal_after_silence(
-                            previous[0] if previous else None,
+                        previous_ts = previous[0] if previous else None
+
+                        # 只在进程启动暖机期抑制 24h 以上的陈旧历史触发。
+                        # 正常运行期不应用 active_hours，真实新信号仍按 >12h 开新段。
+                        ignore_for_window = should_ignore_stale_signal_during_startup(
+                            previous_ts,
                             beijing_time,
-                            silent_hours=self.SILENT_HOURS,
+                            startup_age_seconds,
+                            startup_grace_seconds=self.STARTUP_WARMUP_SECONDS,
                             active_hours=self.ACTIVE_HOURS,
                         )
+                        is_first_window = (
+                            False
+                            if ignore_for_window
+                            else is_first_signal_after_silence(
+                                previous_ts,
+                                beijing_time,
+                                silent_hours=self.SILENT_HOURS,
+                            )
+                        )
 
-                    # 无论后续是否推送，原始信号都入库，Top 统计口径不变。
+                    # 原始信号始终保存，Top 排名仍读取全部 urgent 记录，包括启动期忽略记录。
                     cursor.execute(
                         """
-                        INSERT INTO alerts (symbol, signal_type, message, price_at_alert, priority, timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO alerts (
+                            symbol, signal_type, message, price_at_alert, priority,
+                            timestamp, notify_window_ignored
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (symbol, signal_type, msg, price, priority, beijing_time),
+                        (
+                            symbol, signal_type, msg, price, priority, beijing_time,
+                            1 if ignore_for_window else 0,
+                        ),
                     )
                     new_id = cursor.lastrowid
                     conn.commit()
