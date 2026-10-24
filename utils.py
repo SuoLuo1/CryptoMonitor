@@ -210,8 +210,8 @@ class TelegramNotifier:
         只保存原始信号，不发送 Telegram。
 
         check_first_window=True 时，会在同一 SQLite 写事务中判断当前信号是否为
-        12h 连续段首条，再插入当前记录。默认返回值仍是原三元组；启用后追加
-        第四项 is_first_window 与第五项 new_id（本次记录主键），避免旧调用方受到影响。
+        12h 连续段首条，再插入当前记录。默认返回值仍是原三元组；启用后追加：
+        第四项 is_first_window、第五项 new_id、第六项是否因启动期陈旧历史而忽略窗口。
         """
         return await self._save_alert_to_db(
             msg, priority=priority, symbol=symbol, signal_type=signal_type,
