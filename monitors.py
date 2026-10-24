@@ -149,7 +149,11 @@ class Monitors:
         # 事件级裁决和 12h 分段首条是两个独立条件：两者都满足才发送。
         if allow and not first_in_window:
             allow = False
-            reason = "symbol_already_notified"
+            startup_ignored = bool(db_result and len(db_result) > 5 and db_result[5])
+            reason = (
+                "stale_history_during_startup"
+                if startup_ignored else "symbol_already_notified"
+            )
 
         event = SignalDeduplicator.active_events.get(symbol)
         event_id = event.event_id if event is not None else "-"
@@ -476,10 +480,19 @@ class Monitors:
                         trend_trace = f"{symbol}:{int(time.time() * 1000)}:trend"
                         # 趋势信号使用与 Top 相同的 12h 分段边界；所有信号仍然入库。
                         if not trend_first_in_window:
+                            startup_ignored = bool(
+                                trend_db_result
+                                and len(trend_db_result) > 5
+                                and trend_db_result[5]
+                            )
+                            suppress_reason = (
+                                "stale_history_during_startup"
+                                if startup_ignored else "symbol_already_notified"
+                            )
                             logger.info(
                                 f"[SIGNAL_TRACE] trace_id={trend_trace} symbol={symbol} "
                                 f"kind=trend decision=SUPPRESS "
-                                f"reason=symbol_already_notified "
+                                f"reason={suppress_reason} "
                                 f"event_id=- db={trend_db_status} price={price}"
                             )
                             return
