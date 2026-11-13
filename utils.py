@@ -286,6 +286,9 @@ class TelegramNotifier:
     #   只存一个时间戳; 新增次数直接从 alerts.db 区间计数得到, 不存计数快照。
     #   任何一次 Top 发送(首次信号 / 心跳)都推进水位。
     TOP_RANK_SNAPSHOT_PATH = '/root/CryptoMonitor/top_rank_snapshot.json'
+    # 🐾 本次 Top 查询时刻 (由 get_today_symbols_top 写入), 写回快照时复用,
+    #    保证 delta 区间右端与水位严格一致。
+    _last_top_query_at = None
 
     def _read_top_rank_snapshot(self):
         """读取上次发送 Top 的时刻。文件缺失/损坏时返回 None (首次运行降级为老排序)。"""
@@ -316,33 +319,29 @@ class TelegramNotifier:
         """统计 (since_str, 现在] 区间内每个币的 urgent 报警条数。
 
         区间计数与 12h 窗口无关, 所以币因沉寂重置窗口也不影响增量。
+        since_str 为 None (首次运行 / 快照缺失) 时返回空 dict,
+        表示"没有参照点", 增量为 0 —— 绝不能退化成统计全部历史报警。
         返回 {symbol: count}
         """
         import sqlite3
         out = {}
+        if not since_str:
+            # 🐾 无参照点 → 增量全部为 0, 排序退回原口径。
+            #    若这里退化成全量统计, 首次运行会显示 +2000 这种累计总数, 是错的。
+            return out
         try:
             conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
             cursor = conn.cursor()
-            if since_str:
-                cursor.execute(
-                    """
-                    SELECT symbol, COUNT(*) FROM alerts
-                    WHERE priority = 'urgent'
-                      AND price_at_alert IS NOT NULL
-                      AND timestamp > ?
-                    GROUP BY symbol
-                    """,
-                    (since_str,),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT symbol, COUNT(*) FROM alerts
-                    WHERE priority = 'urgent'
-                      AND price_at_alert IS NOT NULL
-                    GROUP BY symbol
-                    """
-                )
+            cursor.execute(
+                """
+                SELECT symbol, COUNT(*) FROM alerts
+                WHERE priority = 'urgent'
+                  AND price_at_alert IS NOT NULL
+                  AND timestamp > ?
+                GROUP BY symbol
+                """,
+                (since_str,),
+            )
             out = {row[0]: int(row[1]) for row in cursor.fetchall()}
             conn.close()
         except Exception as e:
@@ -483,8 +482,10 @@ class TelegramNotifier:
             result.append(text)
 
         # 🐾 推进水位: 任何一次 Top 发送(首次信号 / 心跳)都算"上次发送时刻"
-        #    必须在消息渲染完成后再写, 否则 delta 起点会早于本次实际发送。
-        self._write_top_rank_snapshot(datetime.now(BJ_TZ))
+        #    用 get_today_symbols_top 的查询时刻, 与 delta 区间右端严格一致,
+        #    渲染耗时期间的新报警不会漏算也不会重复算。
+        snapshot_at = getattr(self, '_last_top_query_at', None) or datetime.now(BJ_TZ)
+        self._write_top_rank_snapshot(snapshot_at)
 
         return result
 
@@ -745,6 +746,9 @@ class TelegramNotifier:
             #    🐾 主人 11-14 拍板: 首要按"上次发送 Top 之后新增的报警条数"排序,
             #       直观回答"这期间有没有币异动"; 增量相同时退回原本的窗口次数排序。
             #    增量来自 DB 区间计数, 与 12h 窗口重置无关, 不会为负。
+            #    🐾 快照时刻 = 本次 DB 查询时刻, 与写回的水位严格一致,
+            #       避免渲染耗时期间的新报警被漏算。
+            query_at = datetime.now()
             prev_at = self._read_top_rank_snapshot()
             prev_str = prev_at.strftime('%Y-%m-%d %H:%M:%S') if prev_at else None
             delta_map = self._get_alert_counts_since(prev_str)
@@ -758,6 +762,9 @@ class TelegramNotifier:
                 sym, cnt, fp, lp, ws_ts, last_ts, delta = r
                 ws_str = ws_ts.strftime('%Y-%m-%d %H:%M:%S') if isinstance(ws_ts, _dt) else ws_ts
                 out.append((sym, cnt, fp, lp, ws_str, delta))
+            # 🐾 额外返回本次查询时刻, 供渲染层写回快照时保证区间无缝
+            #    (增量区间右端 == 写回水位, 渲染耗时期间的新报警不漏算)
+            self._last_top_query_at = query_at
             return out
 
         except Exception as e:
@@ -1062,7 +1069,7 @@ class TelegramNotifier:
     #   - 距上次 Top 推送 (含信号触发的推送) 超过 TOP_HEARTBEAT_MIN_GAP 秒 → 主动推一次 Top
     #   - Top 里没有任何币 → 说明今天还没有任何信号, 不推 (避免开场刷屏)
     TOP_HEARTBEAT_INTERVAL = 60          # 检查间隔 (秒)
-    TOP_HEARTBEAT_MIN_GAP = 30 * 60      # 距上次推送的最小间隔 (30 分钟)
+    TOP_HEARTBEAT_MIN_GAP = 15 * 60      # 距上次推送的最小间隔 (15 分钟, 主人 11-14 改)
     _last_top_push_ts = 0.0              # 上次推送 Top 的时间戳
 
     async def _top_heartbeat_loop(self):
@@ -1073,7 +1080,7 @@ class TelegramNotifier:
                     break
 
                 now = time.time()
-                # 距上次推送不足 30 分钟 → 不推
+                # 距上次推送不足 TOP_HEARTBEAT_MIN_GAP → 不推
                 if self._last_top_push_ts and (
                     now - self._last_top_push_ts < self.TOP_HEARTBEAT_MIN_GAP
                 ):
