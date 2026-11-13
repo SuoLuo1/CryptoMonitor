@@ -282,6 +282,73 @@ class TelegramNotifier:
     # 🐾 Telegram 单条消息上限 4096, 留出余量避免被拒
     TG_SAFE_LIMIT = 3800
 
+    # 🐾 Top 排名快照 (主人 11-14 拍板): 按"上次发送后新增报警次数"排序
+    #   只存一个时间戳; 新增次数直接从 alerts.db 区间计数得到, 不存计数快照。
+    #   任何一次 Top 发送(首次信号 / 心跳)都推进水位。
+    TOP_RANK_SNAPSHOT_PATH = '/root/CryptoMonitor/top_rank_snapshot.json'
+
+    def _read_top_rank_snapshot(self):
+        """读取上次发送 Top 的时刻。文件缺失/损坏时返回 None (首次运行降级为老排序)。"""
+        try:
+            if not os.path.isfile(self.TOP_RANK_SNAPSHOT_PATH):
+                return None
+            with open(self.TOP_RANK_SNAPSHOT_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            raw = (data or {}).get('last_sent_at')
+            if not raw:
+                return None
+            return datetime.fromisoformat(str(raw))
+        except Exception as e:
+            logger.warning(f"⚠️ [Top快照] 读取失败, 降级为原排序: {e}")
+            return None
+
+    def _write_top_rank_snapshot(self, moment):
+        """写入本次发送 Top 的时刻, 作为下次增量计算的起点。"""
+        try:
+            tmp = self.TOP_RANK_SNAPSHOT_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({'last_sent_at': moment.strftime('%Y-%m-%d %H:%M:%S')}, f)
+            os.replace(tmp, self.TOP_RANK_SNAPSHOT_PATH)
+        except Exception as e:
+            logger.warning(f"⚠️ [Top快照] 写入失败: {e}")
+
+    def _get_alert_counts_since(self, since_str):
+        """统计 (since_str, 现在] 区间内每个币的 urgent 报警条数。
+
+        区间计数与 12h 窗口无关, 所以币因沉寂重置窗口也不影响增量。
+        返回 {symbol: count}
+        """
+        import sqlite3
+        out = {}
+        try:
+            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+            cursor = conn.cursor()
+            if since_str:
+                cursor.execute(
+                    """
+                    SELECT symbol, COUNT(*) FROM alerts
+                    WHERE priority = 'urgent'
+                      AND price_at_alert IS NOT NULL
+                      AND timestamp > ?
+                    GROUP BY symbol
+                    """,
+                    (since_str,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT symbol, COUNT(*) FROM alerts
+                    WHERE priority = 'urgent'
+                      AND price_at_alert IS NOT NULL
+                    GROUP BY symbol
+                    """
+                )
+            out = {row[0]: int(row[1]) for row in cursor.fetchall()}
+            conn.close()
+        except Exception as e:
+            logger.error(f"❌ [Top快照] 区间计数失败: {e}", exc_info=True)
+        return out
+
     def _build_top_ranked_msgs(self, current_symbol, current_signal_type, current_msg):
         """
         构建带今日 Top 排行的推送消息 (可能拆成多条)。
@@ -312,7 +379,7 @@ class TelegramNotifier:
 
         # 3. 渲染排行 (每一行独立)
         lines = []
-        for i, (sym, cnt, first_p, latest_p, first_ts) in enumerate(top_list, 1):
+        for i, (sym, cnt, first_p, latest_p, first_ts, delta) in enumerate(top_list, 1):
             # 🔥 等级：第1次无标记，第2-3次 🔥，第4+ 次 🔥🔥🔥
             if cnt >= 4:
                 fire = "🔥🔥🔥"
@@ -354,7 +421,10 @@ class TelegramNotifier:
             # 当前信号标记
             current_mark = " ◀" if sym == current_symbol else ""
 
-            line = f"{i:2d}. {sym:13s} ⏱{first_time} {cnt}次{fire:6s} {main_dir} {pct_str}{current_mark}"
+            # 🐾 增量标记 (主人 11-14): 这期间新增的报警条数, 直观反映"有没有异动"
+            delta_mark = f" +{delta}" if delta else ""
+
+            line = f"{i:2d}. {sym:13s} ⏱{first_time} {cnt}次{fire:6s} {main_dir} {pct_str}{current_mark}{delta_mark}"
             lines.append(line)
 
         # 4. 分批: 每批最多 TOP_BATCH_ROWS 行, 且不超过 TG 安全长度
@@ -411,6 +481,10 @@ class TelegramNotifier:
             if is_last and not is_heartbeat:
                 text += separator + current_msg
             result.append(text)
+
+        # 🐾 推进水位: 任何一次 Top 发送(首次信号 / 心跳)都算"上次发送时刻"
+        #    必须在消息渲染完成后再写, 否则 delta 起点会早于本次实际发送。
+        self._write_top_rank_snapshot(datetime.now(BJ_TZ))
 
         return result
 
@@ -667,15 +741,23 @@ class TelegramNotifier:
 
                 results.append((sym, cnt, win_start_price, latest_price, win_start_ts, last_ts))
 
-            # 3. 排序: cnt DESC, last_alert DESC, 截 limit
-            results.sort(key=lambda x: (-x[1], -x[5].timestamp()))
+            # 3. 排序: 增量 DESC, 12h窗口cnt DESC, 最后报警时间 DESC
+            #    🐾 主人 11-14 拍板: 首要按"上次发送 Top 之后新增的报警条数"排序,
+            #       直观回答"这期间有没有币异动"; 增量相同时退回原本的窗口次数排序。
+            #    增量来自 DB 区间计数, 与 12h 窗口重置无关, 不会为负。
+            prev_at = self._read_top_rank_snapshot()
+            prev_str = prev_at.strftime('%Y-%m-%d %H:%M:%S') if prev_at else None
+            delta_map = self._get_alert_counts_since(prev_str)
+            # results 元素为 tuple, 需要可变结构才能挂 delta → 改用 list
+            results = [list(r) + [delta_map.get(r[0], 0)] for r in results]
+            results.sort(key=lambda x: (-x[6], -x[1], -x[5].timestamp()))
 
             # 🐾 出口转字符串: 内部用 datetime 是为了算间隔方便, 渲染层继续用 ISO 字符串 (向后兼容)
             out = []
             for r in results[:limit]:
-                sym, cnt, fp, lp, ws_ts, last_ts = r
+                sym, cnt, fp, lp, ws_ts, last_ts, delta = r
                 ws_str = ws_ts.strftime('%Y-%m-%d %H:%M:%S') if isinstance(ws_ts, _dt) else ws_ts
-                out.append((sym, cnt, fp, lp, ws_str))
+                out.append((sym, cnt, fp, lp, ws_str, delta))
             return out
 
         except Exception as e:
