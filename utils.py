@@ -366,13 +366,17 @@ class TelegramNotifier:
         # 🐾 跨天日期显示需要 datetime 类 (10-04)
         _dt = datetime
 
-        # 1. 查今日所有 symbol 排行 (不限数量)
-        top_list = self.get_today_symbols_top(limit=10000)
+        # 1. 查今日所有 symbol 排行 (只取 Top 50, 主人 11-14: 一条消息搞定)
+        top_list = self.get_today_symbols_top(limit=self.TOP_BATCH_ROWS)
+
+        # 🐾 统计总币数 (用于头部显示 "Top 50 / 共 N 个"), 避免头部说"共 50 个"误导
+        total_syms = self._count_active_symbols()
 
         # 2. 渲染顶部
         header = (
             "═══════════════════════════════\n"
-            f"📊 今日所有信号 Top ({now_str}) · 共 {len(top_list)} 个币\n"
+            f"📊 今日所有信号 Top ({now_str}) · 共 {total_syms} 个币"
+            f"（显示前 {len(top_list)}）\n"
             "═══════════════════════════════\n"
         )
 
@@ -464,16 +468,16 @@ class TelegramNotifier:
             if total_batches > 1:
                 batch_header = (
                     "═══════════════════════════════\n"
-                    f"📊 今日所有信号 Top ({now_str}) · 共 {len(top_list)} 个币 "
-                    f"(第 {idx + 1}/{total_batches} 批)\n"
+                    f"📊 今日所有信号 Top ({now_str}) · 共 {total_syms} 个币 "
+                    f"(显示前 {len(top_list)} · 第 {idx + 1}/{total_batches} 批)\n"
                     "═══════════════════════════════\n"
                 )
             elif is_heartbeat:
                 # 🐾 心跳消息头部标注, 让主人知道这是定期刷新而非新信号
                 batch_header = (
                     "═══════════════════════════════\n"
-                    f"📊 今日所有信号 Top ({now_str}) · 共 {len(top_list)} 个币 "
-                    f"(定期刷新 · 市场平静)\n"
+                    f"📊 今日所有信号 Top ({now_str}) · 共 {total_syms} 个币 "
+                    f"(显示前 {len(top_list)} · 定期刷新 · 市场平静)\n"
                     "═══════════════════════════════\n"
                 )
             text = batch_header + "\n".join(batch_lines)
@@ -770,6 +774,51 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"❌ [get_today_symbols_top] 查询失败：{e}", exc_info=True)
             return []
+
+    def _count_active_symbols(self):
+        """统计符合 Top 入选条件的币种总数 (与 get_today_symbols_top 同一套筛选口径)。
+
+        🐾 主人 11-14: Top 只显示前 50, 但头部要显示真实总数 (共 N 个币),
+           否则会被误解成"总共就 50 个币"。
+        """
+        import sqlite3
+        from collections import defaultdict
+        from datetime import datetime as _dt
+        try:
+            conn = sqlite3.connect('/root/CryptoMonitor/alerts.db')
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT symbol, timestamp FROM alerts
+                WHERE priority = 'urgent' AND price_at_alert IS NOT NULL
+                ORDER BY symbol ASC, timestamp ASC
+                """
+            )
+            raw_rows = cursor.fetchall()
+            conn.close()
+            if not raw_rows:
+                return 0
+
+            per_sym = defaultdict(list)
+            for sym, ts in raw_rows:
+                per_sym[sym].append(_dt.fromisoformat(ts))
+
+            SILENT = self.SILENT_HOURS * 3600.0
+            ACTIVE = self.ACTIVE_HOURS * 3600.0
+            now_epoch = _dt.now().timestamp()
+            count = 0
+            for sym, recs in per_sym.items():
+                if not recs:
+                    continue
+                last_epoch = recs[-1].timestamp()
+                # 僵尸币过滤: 最后一次 urgent 距今 > ACTIVE_HOURS → 不算
+                if now_epoch - last_epoch > ACTIVE:
+                    continue
+                count += 1
+            return count
+        except Exception as e:
+            logger.error(f"❌ [_count_active_symbols] 查询失败：{e}", exc_info=True)
+            return 0
 
     # --- 方法 B: 缓冲发送 (进篮子) ---
 
@@ -1086,12 +1135,12 @@ class TelegramNotifier:
                 ):
                     continue
 
-                # 查 Top (不限数量), 没有币说明今天还没有任何信号
+                # 查 Top (只看数量判断有没有币, 不需要全量列表)
                 loop = asyncio.get_event_loop()
-                top_list = await loop.run_in_executor(
-                    None, self.get_today_symbols_top, 10000
+                total_syms = await loop.run_in_executor(
+                    None, self._count_active_symbols
                 )
-                if not top_list:
+                if not total_syms:
                     continue
 
                 # 构造纯 Top 消息 (无当前信号)
@@ -1109,7 +1158,7 @@ class TelegramNotifier:
                 self._last_top_push_ts = now
                 logger.info(
                     f"📊 [Top 心跳] 市场安静, 主动推送最新 Top "
-                    f"({len(top_list)} 个币, {len(msgs)} 批)"
+                    f"(共 {total_syms} 个币, 显示前 {self.TOP_BATCH_ROWS}, {len(msgs)} 批)"
                 )
             except asyncio.CancelledError:
                 break
