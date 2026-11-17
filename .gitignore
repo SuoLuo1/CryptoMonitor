@@ -59,3 +59,10 @@ config.yml
 credentials.json
 secrets.json
 backtest_results/
+
+# ==================== 回测缓存与原始数据导出 ====================
+# K线缓存体积可达 GB 级，属于可再生数据，禁止入库
+klines_cache.sqlite3
+*-raw-data.txt
+backtest_*/klines_cache.sqlite3
+
