@@ -1,7 +1,7 @@
 # symbol_manager.py
 import aiohttp
 import logging
-from config import BINANCE_HTTP_FUTURES, QUOTE_ASSET, MIN_VOLUME_24H, BLACKLIST, MIN_VOLUME_TG, MIN_VOLUME_AI
+from config import BINANCE_HTTP_FUTURES, QUOTE_ASSET, MIN_VOLUME_24H, BLACKLIST, MIN_VOLUME_TG, MIN_VOLUME_AI, TRADIFI_WHITELIST
 from shared.binance_limiter import limited_get_async
 
 logger = logging.getLogger("SymbolMgr")
@@ -31,8 +31,16 @@ async def get_active_symbols(session):
             # 【核心过滤参数】
             # 1. 必须是交易中 (TRADING)
             if s['status'] != 'TRADING': continue
-            # 2. 必须是永续合约 (PERPETUAL) -> 自动过滤掉交割单、BFUSD 等奇怪东西
-            if s['contractType'] != 'PERPETUAL': continue
+            # 2. 必须是永续合约 -> 自动过滤掉交割单 (CURRENT_QUARTER)、BFUSD 等奇怪东西
+            #    TradFi 永续 (NVDA/TSLA/XAU 等) 是 TRADIFI_PERPETUAL，整类默认不监控，
+            #    只放行 config.TRADIFI_WHITELIST 里按成交额挑选的头部标的。
+            ctype = s['contractType']
+            if ctype == 'PERPETUAL':
+                pass
+            elif ctype == 'TRADIFI_PERPETUAL' and s['symbol'] in TRADIFI_WHITELIST:
+                pass
+            else:
+                continue
             # 3. 必须是 USDT 结算
             if s['quoteAsset'] != QUOTE_ASSET: continue
 

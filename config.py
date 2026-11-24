@@ -72,3 +72,22 @@ OI_MAX_STALENESS = 120           # OI 数据最大允许延迟（秒）
 REVERSE_SHOCK_PCT = 0.04         # 从事件高点/低点反向移动至少 4%
 REVERSE_SHOCK_VOL_RATIO = 2.0    # 当前 1m 成交额至少为此前 5 根已收盘 1m 均量的 2 倍
 DB_DEDUP_COOLDOWN = 60           # 保留原有同类原始信号入库限频，避免 Top 计数被 WS 更新放大
+
+# === TradFi 永续白名单 (contractType = TRADIFI_PERPETUAL) ===
+# 股票/ETF/商品/外汇类合约（NVDA/TSLA/XAU/XAG...）不属于普通 PERPETUAL，
+# 没有白名单就会被 symbol_manager 第一步过滤掉，导致整类标的不报警。
+# 这里只放行 24h 成交额前 50 名：实测占 TradFi 总成交额 96.7%（342.5亿 / 354.6亿），
+# 换来 +50 个币的 WS 流与 OI 轮询开销（约 +10%），避免把 245 个全塞进来。
+# 重新生成：venv/bin/python3 refresh_tradifi_whitelist.py
+TRADIFI_WHITELIST = {
+    'SOXLUSDT', 'NVDAUSDT', 'XAUUSDT', 'SOXSUSDT', 'SKHYNIXUSDT',
+    'SNDKUSDT', 'SPCXUSDT', 'MUUSDT', 'XAGUSDT', 'KORUUSDT',
+    'ANTUSDT', 'QQQUSDT', 'SKHYUSDT', 'CLUSDT', 'BZUSDT',
+    'SNXXUSDT', 'TQQQUSDT', 'AMDUSDT', 'INTCUSDT', 'SPYUSDT',
+    'EWYUSDT', 'MUUUSDT', 'MSTRUSDT', 'NBISUSDT', 'SAMSUNGUSDT',
+    'DRAMUSDT', 'TSLAUSDT', 'GOOGLUSDT', 'CRCLUSDT', 'MRVLUSDT',
+    'SQQQUSDT', 'MVLLUSDT', 'AAPLUSDT', 'CRWVUSDT', 'NVDLUSDT',
+    'AAOIUSDT', 'COSTUSDT', 'UNITREEUSDT', 'ZHONGJIUSDT', 'ZHIPUUSDT',
+    'LITEUSDT', 'SKDDUSDT', 'CBRSUSDT', 'METAUSDT', 'TSMUSDT',
+    'INTWUSDT', 'COINUSDT', 'AVGOUSDT', 'CSOPSKHYNIX2LUSDT', 'BEUSDT',
+}
